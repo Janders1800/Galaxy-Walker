@@ -1,5 +1,5 @@
 # Galaxy Walker Demo
-
+<img width="1919" height="1079" alt="Screenshot" src="https://github.com/user-attachments/assets/a5e6e86f-7333-4330-9874-da513ac3d4f6" />
 A single-file WebGL2 space + planet explorer: walk/fly around procedural planets, open a galaxy map, and **warp** to new star systems with atmospheres, clouds, oceans, and post effects. 
 
 ## Features
