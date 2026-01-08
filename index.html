@@ -1859,6 +1859,11 @@ void main(){
                         side: THREE.DoubleSide,
                     });
 
+                    // Per-ocean occluder buffers (can’t be shared across bodies like atmo passes).
+                    // Matches the atmosphere eclipse cap (24).
+                    this._oceanOccCenters = new Float32Array(24 * 3);
+                    this._oceanOccRadii = new Float32Array(24);
+
                     oceanMat.onBeforeCompile = (shader) => {
                         shader.uniforms.uTime = { value: 0 };
                         shader.uniforms.uWaveAmp = {
@@ -1882,6 +1887,17 @@ void main(){
                         };
                         shader.uniforms.uNightDarken = { value: 3.2 };
                         shader.uniforms.uMinLight = { value: 0.02 };
+
+                        // Eclipse occluders (same interface as atmospheres)
+                        shader.uniforms.uOccCount = { value: 0 };
+                        shader.uniforms.uOccCenters = {
+                            value: this._oceanOccCenters,
+                        };
+                        shader.uniforms.uOccRadii = {
+                            value: this._oceanOccRadii,
+                        };
+                        shader.uniforms.uEclipseSoftness = { value: 0.015 };
+                        shader.uniforms.uEclipseStrength = { value: 1.0 };
 
                         shader.vertexShader = shader.vertexShader.replace(
                             "#include <common>",
@@ -1926,37 +1942,97 @@ vWavyNormal = normalize(n + vec3(-hx, 0.0, -hz) * 0.18);`,
                         shader.fragmentShader = shader.fragmentShader.replace(
                             "#include <common>",
                             `#include <common>
-uniform float uTime;
-uniform float uMurk;
+	uniform float uTime;
+	uniform float uMurk;
 
-uniform vec3 uPlanetCenterW;
-uniform vec3 uSunPosW;
-uniform float uNightDarken;
-uniform float uMinLight;
+	uniform vec3 uPlanetCenterW;
+	uniform vec3 uSunPosW;
+		uniform float uNightDarken;
+		uniform float uMinLight;
 
-varying vec3 vWorldPos;
-varying vec3 vWavyNormal;`,
+	uniform int   uOccCount;
+	uniform vec3  uOccCenters[24];
+	uniform float uOccRadii[24];
+	uniform float uEclipseSoftness;
+	uniform float uEclipseStrength;
+
+		float gNightMask;
+		float gEclipseDim;
+
+	float raySphereHit(vec3 ro, vec3 rd, vec3 c, float r){
+	  vec3 oc = ro - c;
+	  float b = dot(oc, rd);
+	  float c0 = dot(oc, oc) - r*r;
+	  float h = b*b - c0;
+	  if(h < 0.0) return 1e9;
+	  h = sqrt(h);
+	  float t0 = -b - h;
+	  float t1 = -b + h;
+	  if(t0 > 0.0) return t0;
+	  if(t1 > 0.0) return t1;
+	  return 1e9;
+	}
+
+	float sunVisibility(vec3 pW, vec3 sunPosW){
+	  vec3 rd = normalize(sunPosW - pW);
+	  float maxT = length(sunPosW - pW);
+	  float vis = 1.0;
+	  for(int i=0; i<24; i++){
+	    if(i >= uOccCount) break;
+	    float tHit = raySphereHit(pW, rd, uOccCenters[i], uOccRadii[i]);
+	    if(tHit < maxT){
+	      vec3 oc = pW - uOccCenters[i];
+	      float b = dot(oc, rd);
+	      float d2 = dot(oc, oc) - b*b;
+	      float d = sqrt(max(d2, 0.0));
+	      float r = uOccRadii[i];
+	      float edge = smoothstep(r, r + r*uEclipseSoftness, d);
+	      vis = min(vis, edge);
+	    }
+	  }
+	  return mix(1.0, vis, clamp(uEclipseStrength, 0.0, 1.0));
+	}
+
+	varying vec3 vWorldPos;
+	varying vec3 vWavyNormal;`,
                         );
 
                         shader.fragmentShader = shader.fragmentShader.replace(
                             "#include <color_fragment>",
                             `#include <color_fragment>
-vec3 sunDir = normalize(uSunPosW - uPlanetCenterW);
-vec3 upP = normalize(vWorldPos - uPlanetCenterW);
-float day = clamp(dot(upP, sunDir) * 0.5 + 0.5, 0.0, 1.0);
-float nightMask = mix(uMinLight, 1.0, pow(day, uNightDarken));
-diffuseColor.rgb *= nightMask;`,
+	vec3 sunDir = normalize(uSunPosW - uPlanetCenterW);
+	vec3 upP = normalize(vWorldPos - uPlanetCenterW);
+	float day = clamp(dot(upP, sunDir) * 0.5 + 0.5, 0.0, 1.0);
+	float nightMask = mix(uMinLight, 1.0, pow(day, uNightDarken));
+
+	// Eclipse dim (matches atmosphere behavior)
+	float vis = sunVisibility(vWorldPos, uSunPosW);
+		float eclipseDim = mix(1.0, 0.45, 1.0 - vis);
+	nightMask *= eclipseDim;
+		gEclipseDim = eclipseDim;
+
+	gNightMask = nightMask;
+	diffuseColor.rgb *= nightMask;`,
                         );
 
                         shader.fragmentShader = shader.fragmentShader.replace(
                             "#include <lights_fragment_begin>",
                             `#include <lights_fragment_begin>
-vec3 V = normalize(cameraPosition - vWorldPos);
-float fres = pow(1.0 - max(dot(normalize(vWavyNormal), V), 0.0), 3.0);
+	vec3 V = normalize(cameraPosition - vWorldPos);
+	float fres = pow(1.0 - max(dot(normalize(vWavyNormal), V), 0.0), 3.0);
 
-vec3 murkCol = vec3(0.03, 0.10, 0.14);
-diffuseColor.rgb = mix(diffuseColor.rgb, murkCol, uMurk);
-diffuseColor.rgb += fres * 0.16;`,
+	vec3 murkCol = vec3(0.03, 0.10, 0.14);
+	diffuseColor.rgb = mix(diffuseColor.rgb, murkCol, uMurk);
+	// Keep the rim/glint from blowing out at night or during eclipses
+	diffuseColor.rgb += fres * 0.16 * gNightMask;`,
+                        );
+
+                        // Dim direct sunlight on the ocean during eclipses (affects specular too).
+                        shader.fragmentShader = shader.fragmentShader.replace(
+                            "#include <lights_fragment_end>",
+                            `#include <lights_fragment_end>
+	reflectedLight.directDiffuse *= gEclipseDim;
+	reflectedLight.directSpecular *= gEclipseDim;`,
                         );
 
                         oceanMat.userData.shader = shader;
@@ -4662,6 +4738,80 @@ void main(){
             const occluderCenters = new Float32Array(MAX_OCCLUDERS * 3);
             const occluderRadii = new Float32Array(MAX_OCCLUDERS);
 
+            // Shared eclipse helpers (CPU side) for things that aren’t in the atmo shader
+            // (e.g. underwater fog / post tint). Mirrors the GLSL in atmoFS.
+            function bodyRadiusForEclipse(b) {
+                const sl = b?.seaLevel;
+                if (typeof sl === "number" && sl > 0) return sl;
+                const br = b?.cfg?.baseRadius ?? b?.baseRadius;
+                return typeof br === "number" && isFinite(br) && br > 0
+                    ? br
+                    : 1400;
+            }
+
+            function raySphereHitCPU(ro, rd, c, r) {
+                const ocx = ro.x - c.x;
+                const ocy = ro.y - c.y;
+                const ocz = ro.z - c.z;
+                const b = ocx * rd.x + ocy * rd.y + ocz * rd.z;
+                const c0 = ocx * ocx + ocy * ocy + ocz * ocz - r * r;
+                let h = b * b - c0;
+                if (h < 0) return 1e9;
+                h = Math.sqrt(h);
+                const t0 = -b - h;
+                const t1 = -b + h;
+                if (t0 > 0) return t0;
+                if (t1 > 0) return t1;
+                return 1e9;
+            }
+
+            function sunVisibilityCPU(
+                pW,
+                sunPosW,
+                ignoreBody,
+                tmp,
+                softness,
+                strength,
+            ) {
+                const toSun = tmp.vD.copy(sunPosW).sub(pW);
+                const maxT = toSun.length();
+                if (maxT <= 1e-6) return 1.0;
+                const rd = toSun.multiplyScalar(1.0 / maxT);
+
+                let vis = 1.0;
+                for (let i = 0; i < bodies.length; i++) {
+                    const b = bodies[i];
+                    if (!b || b === ignoreBody) continue;
+                    const c = b.group.getWorldPosition(tmp.vE.set(0, 0, 0));
+                    const r = bodyRadiusForEclipse(b);
+
+                    const tHit = raySphereHitCPU(pW, rd, c, r);
+                    if (tHit < maxT) {
+                        const ocx = pW.x - c.x;
+                        const ocy = pW.y - c.y;
+                        const ocz = pW.z - c.z;
+                        const bproj = ocx * rd.x + ocy * rd.y + ocz * rd.z;
+                        const d2 = Math.max(
+                            0,
+                            ocx * ocx + ocy * ocy + ocz * ocz - bproj * bproj,
+                        );
+                        const d = Math.sqrt(d2);
+                        const edge = THREE.MathUtils.smoothstep(
+                            d,
+                            r,
+                            r + r * softness,
+                        );
+                        vis = Math.min(vis, edge);
+                    }
+                }
+
+                return THREE.MathUtils.lerp(
+                    1.0,
+                    vis,
+                    THREE.MathUtils.clamp(strength, 0.0, 1.0),
+                );
+            }
+
             // If some eclipses don't work, probably it went over the cap and got ignored
             function fillOccludersForBody(pass, outCenters, outRadii, tmp) {
                 // Allow relevance sorting
@@ -5001,6 +5151,8 @@ void main(){
                 vA: new THREE.Vector3(),
                 vB: new THREE.Vector3(),
                 vC: new THREE.Vector3(),
+                vD: new THREE.Vector3(),
+                vE: new THREE.Vector3(),
                 dq: new THREE.Quaternion(),
                 mLook: new THREE.Matrix4(),
                 qLook: new THREE.Quaternion(),
@@ -5707,6 +5859,23 @@ void main(){
                     );
                     sh.uniforms.uPlanetCenterW.value.copy(centerW);
                     sh.uniforms.uSunPosW.value.copy(tmp.sunPosW);
+
+                    // Feed eclipse occluders to oceans (per-body buffers)
+                    if (
+                        sh.uniforms.uOccCount &&
+                        b._oceanOccCenters &&
+                        b._oceanOccRadii
+                    ) {
+                        const nOcc = fillOccludersForBody(
+                            { body: b, mat: { uniforms: sh.uniforms } },
+                            b._oceanOccCenters,
+                            b._oceanOccRadii,
+                            tmp,
+                        );
+                        sh.uniforms.uOccCount.value = nOcc;
+                        sh.uniforms.uOccCenters.value = b._oceanOccCenters;
+                        sh.uniforms.uOccRadii.value = b._oceanOccRadii;
+                    }
                 }
 
                 // LOD selection + culling
@@ -5778,10 +5947,31 @@ void main(){
 
                         const NIGHT_DARKEN = 3.2;
                         const MIN_LIGHT = 0.02;
-                        const nightMask = THREE.MathUtils.lerp(
+                        let nightMask = THREE.MathUtils.lerp(
                             MIN_LIGHT,
                             1.0,
                             Math.pow(day, NIGHT_DARKEN),
+                        );
+
+                        // Eclipse dim (matches atmosphere behavior)
+                        const vis = sunVisibilityCPU(
+                            camera.position,
+                            tmp.sunPosW,
+                            b,
+                            tmp,
+                            0.015,
+                            1.0,
+                        );
+                        const eclipseDim = THREE.MathUtils.lerp(
+                            1.0,
+                            0.45,
+                            1.0 - vis,
+                        );
+                        nightMask *= eclipseDim;
+                        const dayE = THREE.MathUtils.clamp(
+                            day * eclipseDim,
+                            0,
+                            1,
                         );
 
                         const oceanCol = b.ocean.material.color;
@@ -5791,13 +5981,14 @@ void main(){
                             .multiplyScalar(0.45 * nightMask);
                         scene.fog.density =
                             (0.05 + depth01 * 0.02) *
-                            (0.85 + 0.35 * (1.0 - day));
+                            (0.85 + 0.35 * (1.0 - dayE));
 
                         tintMat.uniforms.uColor.value
                             .copy(oceanCol)
                             .multiplyScalar(0.35 * nightMask);
                         tintMat.uniforms.uOpacity.value =
-                            (0.16 + depth01 * 0.28) * (0.7 + 0.3 * (1.0 - day));
+                            (0.16 + depth01 * 0.28) *
+                            (0.7 + 0.3 * (1.0 - dayE));
 
                         const pulse = 0.5 + 0.5 * Math.sin(t * 1.4);
                         particlesMat.uniforms.uColor.value
@@ -5806,7 +5997,7 @@ void main(){
                         particlesMat.uniforms.uOpacity.value =
                             (0.05 + depth01 * 0.22) *
                             (0.7 + 0.3 * pulse) *
-                            (0.75 + 0.25 * (1.0 - day));
+                            (0.75 + 0.25 * (1.0 - dayE));
                     }
                 }
 
