@@ -2,6 +2,8 @@
 <img width="1917" height="911" alt="Captura de pantalla 2026-02-03 024410" src="https://github.com/user-attachments/assets/87e6a33b-7e50-4add-a0af-84e784cf6b34" />
 
 A single-file WebGL2 space + planet explorer: walk/fly around procedural planets, open a galaxy map, and **warp** to new star systems with atmospheres, clouds, oceans, and post effects. 
+## Play
+https://janders1800.github.io/Galaxy-Walker/
 
 ## Features
 - **Procedural star system** generation (seeded) + rebuild on warp 
