@@ -1,5 +1,6 @@
 # Galaxy Walker Demo
-<img width="1919" height="1079" alt="Screenshot" src="https://github.com/user-attachments/assets/a5e6e86f-7333-4330-9874-da513ac3d4f6" />
+<img width="1917" height="911" alt="Captura de pantalla 2026-02-03 024410" src="https://github.com/user-attachments/assets/87e6a33b-7e50-4add-a0af-84e784cf6b34" />
+
 A single-file WebGL2 space + planet explorer: walk/fly around procedural planets, open a galaxy map, and **warp** to new star systems with atmospheres, clouds, oceans, and post effects. 
 
 ## Features
@@ -9,7 +10,8 @@ A single-file WebGL2 space + planet explorer: walk/fly around procedural planets
 - **Log-depth atmospheres + clouds** (per planet), moons without atmo 
 - **Galaxy sky dome** + **god rays** (cloud-occluded) 
 - **Galaxy maps**: minimap + fullscreen map with star picking & warp
-- **Warp sequence**: charge → countdown beeps → tunnel travel (unload/load) → fade out/in 
+- **Warp sequence**: charge → countdown beeps → tunnel travel (unload/load) → fade out/in
+- **Unified stardust**: asteroid belts (big + small) share the same stardust effect
 
 ## Controls
 - **Click**: pointer lock / mouse look   
@@ -22,7 +24,17 @@ A single-file WebGL2 space + planet explorer: walk/fly around procedural planets
 - **P** toggle sun lights   
 
 ## Run it
-Just open index.html, it should run localy.
+Serve the folder with a local web server (ES modules/import maps don’t reliably work via file://):
+
+```python3 -m http.server 8080```
+
+Then open:
+
+```http://localhost:8080/```
+
+## Assets
+Space ship by yanix.
+https://sketchfab.com/3d-models/space-ship-356a3acb00164c698d657146caa5ebf3
 
 ## Tech
 three.js.
