@@ -187,19 +187,14 @@ function buildPatchBuffers(p, bodyCfg, biome) {
   const u0 = +p.u0, v0 = +p.v0, u1 = +p.u1, v1 = +p.v1;
   const gridN = p.gridN | 0;
   const normalEps = +p.normalEps;
-  const skirtDepth = +p.skirtDepth;
 
   const N = gridN;
   const vertsPerSide = N + 1;
   const vertCount = vertsPerSide * vertsPerSide;
 
-  const edgeVerts = 4 * vertsPerSide;
-  const skirtBase = vertCount;
-  const totalVerts = vertCount + edgeVerts;
-
-  const pos2 = new Float32Array(totalVerts * 3);
-  const nrm2 = new Float32Array(totalVerts * 3);
-  const col2 = new Float32Array(totalVerts * 3);
+  const pos2 = new Float32Array(vertCount * 3);
+  const nrm2 = new Float32Array(vertCount * 3);
+  const col2 = new Float32Array(vertCount * 3);
 
   const baseRadius = bodyCfg.baseRadius;
   const seaLevel = bodyCfg.seaLevel;
@@ -312,41 +307,6 @@ function buildPatchBuffers(p, bodyCfg, biome) {
                         k += 3;
                     }
                 }
-
-// skirts
-                function copySkirtEdge(getIndexFn, outOffsetVert) {
-                    for (let t = 0; t <= N; t++) {
-                        const baseIndex = getIndexFn(t);
-                        const bi3 = baseIndex * 3;
-                        const oi3 = (outOffsetVert + t) * 3;
-
-                        const nx = nrm2[bi3],
-                            ny = nrm2[bi3 + 1],
-                            nz = nrm2[bi3 + 2];
-
-                        pos2[oi3] = pos2[bi3] - nx * skirtDepth;
-                        pos2[oi3 + 1] = pos2[bi3 + 1] - ny * skirtDepth;
-                        pos2[oi3 + 2] = pos2[bi3 + 2] - nz * skirtDepth;
-
-                        nrm2[oi3] = nx;
-                        nrm2[oi3 + 1] = ny;
-                        nrm2[oi3 + 2] = nz;
-
-                        col2[oi3] = col2[bi3];
-                        col2[oi3 + 1] = col2[bi3 + 1];
-                        col2[oi3 + 2] = col2[bi3 + 2];
-                    }
-                }
-
-                const topOff = skirtBase;
-                const bottomOff = topOff + vertsPerSide;
-                const leftOff = bottomOff + vertsPerSide;
-                const rightOff = leftOff + vertsPerSide;
-
-                copySkirtEdge((t) => 0 * vertsPerSide + t, topOff);
-                copySkirtEdge((t) => N * vertsPerSide + t, bottomOff);
-                copySkirtEdge((t) => t * vertsPerSide + 0, leftOff);
-                copySkirtEdge((t) => t * vertsPerSide + N, rightOff);
 
   return { pos: pos2, nrm: nrm2, col: col2, gridN };
 }

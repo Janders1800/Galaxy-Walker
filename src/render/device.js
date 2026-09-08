@@ -16,8 +16,7 @@ export function createRenderer({
   renderer.shadowMap.enabled = true;
   renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
-  // We manage shadow updates manually for perf
-  renderer.shadowMap.autoUpdate = false;
+  renderer.shadowMap.autoUpdate = true;
 
   renderer.autoClear = false;
   renderer.autoClearColor = false;

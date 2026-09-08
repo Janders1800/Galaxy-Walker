@@ -30,10 +30,18 @@ export class GasGiantBody {
     this.lodDist = cfg.lodDist ?? this.baseRadius * 30.0;
 
     // Main visual mesh
-    const seg = cfg.segments ?? 192;
-    const geo = new THREE.SphereGeometry(this.baseRadius, seg, seg);
+    const widthSegments = cfg.widthSegments ?? cfg.segments ?? 96;
+    const heightSegments =
+      cfg.heightSegments ?? Math.max(24, Math.round(widthSegments * 0.5));
+    const geo = new THREE.SphereGeometry(
+      this.baseRadius,
+      widthSegments,
+      heightSegments,
+    );
     const { material, uniforms, randomizeStrip } = createGasGiantMaterial({
       seed: (cfg.seed ?? 0) >>> 0,
+      volumeNoiseTexture: cfg.volumeNoiseTexture ?? null,
+      volumeNoiseLayout: cfg.volumeNoiseLayout ?? null,
     });
     this.material = material;
     this.uniforms = uniforms;
@@ -59,6 +67,8 @@ export class GasGiantBody {
     this.currQuat = new THREE.Quaternion();
 
     this._tmpQ = new THREE.Quaternion();
+    this._worldScale = new THREE.Vector3(1, 1, 1);
+    this._transformCacheReady = false;
   }
 
   destroy() {
@@ -73,14 +83,22 @@ export class GasGiantBody {
   }
 
   beginFrameCapture() {
-    this.group.updateMatrixWorld(true);
-    this.group.getWorldPosition(this.prevPos);
-    this.group.getWorldQuaternion(this.prevQuat);
+    this.prevPos.copy(this.currPos);
+    this.prevQuat.copy(this.currQuat);
   }
-  endFrameCapture() {
-    this.group.updateMatrixWorld(true);
-    this.group.getWorldPosition(this.currPos);
-    this.group.getWorldQuaternion(this.currQuat);
+  endFrameCapture(matrixWorldReady = false) {
+    if (!matrixWorldReady) this.group.updateMatrixWorld(true);
+    const hadCache = this._transformCacheReady;
+    this.group.matrixWorld.decompose(
+      this.currPos,
+      this.currQuat,
+      this._worldScale,
+    );
+    if (!hadCache) {
+      this.prevPos.copy(this.currPos);
+      this.prevQuat.copy(this.currQuat);
+    }
+    this._transformCacheReady = true;
   }
 
   updateOrbit(dt) {

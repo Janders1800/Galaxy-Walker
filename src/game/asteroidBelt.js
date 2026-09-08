@@ -11,6 +11,28 @@ function lerp(a, b, t) {
   return a + (b - a) * t;
 }
 
+function pointSegmentDistanceSq(point, start, end) {
+  const dx = end.x - start.x;
+  const dy = end.y - start.y;
+  const dz = end.z - start.z;
+  const lenSq = dx * dx + dy * dy + dz * dz;
+
+  let t = 0.0;
+  if (lenSq > 1e-12) {
+    t =
+      ((point.x - start.x) * dx +
+        (point.y - start.y) * dy +
+        (point.z - start.z) * dz) /
+      lenSq;
+    t = Math.max(0.0, Math.min(1.0, t));
+  }
+
+  const px = start.x + dx * t - point.x;
+  const py = start.y + dy * t - point.y;
+  const pz = start.z + dz * t - point.z;
+  return px * px + py * py + pz * pz;
+}
+
 /**
  * Creates a batched asteroid belt.
  *
@@ -38,6 +60,11 @@ export function createAsteroidBelt({
   // Rock mesh smoothness (Icosahedron subdivision level). Higher => smoother shading.
   // This is shared across all instances, so increasing it is usually cheap.
   rockDetail = 2,
+  // Cheap collision uses one approximate sphere per asteroid. The proxy is
+  // generated alongside the instance matrix, so runtime queries never need to
+  // decode matrices or raycast the rendered geometry.
+  collisionEnabled = true,
+  collisionRadiusScale = 0.78,
   // Optional volumetric-ish cosmic dust band (cheap shader on a large cylinder shell).
   // Pass a noise texture (e.g., world.blueNoiseTex) for nicer breakup.
   // Mesh-based dust volume was replaced by a screen-space, atmosphere-style pass (world.beltDustPass).
@@ -178,8 +205,21 @@ export function createAsteroidBelt({
   }
 
   // Shared rock geometry; visual variety comes from per-instance scaling + rotation.
-  // Use a slightly subdivided icosahedron so normals interpolate smoothly (no faceted look).
-  const geom = makeRuggedRockGeometry(Math.max(2, rockDetail | 0), seed0 ^ 0x13579bdf);
+  // Detail 0 is intentionally allowed for low presets—the previous minimum of 2
+  // made the Potato setting process far more triangles than requested.
+  const geom = makeRuggedRockGeometry(
+    Math.max(0, Math.min(3, rockDetail | 0)),
+    seed0 ^ 0x13579bdf,
+  );
+  const geomCollisionRadius = Math.max(
+    1e-3,
+    geom.boundingSphere?.radius ?? 1.0,
+  );
+  const colliderScale = Math.max(
+    0.1,
+    Math.min(1.25, Number(collisionRadiusScale) || 0.78),
+  );
+  let maxCollisionRadius = 0.0;
 
   // Terrain-like rock material:
   // - MeshStandardMaterial like planet/moon terrains
@@ -331,6 +371,7 @@ if (!keepBaseColor) {
         uEclipseSoftness: { value: dustEclipseSoftness },
         uEclipseStrength: { value: dustEclipseStrength },
         uSunPosW: { value: new THREE.Vector3() },
+        uSunRadius: { value: 1350.0 },
       },
       vertexShader: RING_DUST_VS,
       fragmentShader: RING_DUST_FS,
@@ -515,15 +556,9 @@ if (!keepBaseColor) {
     mesh.userData.ignoreMinimap = true;
     mesh.castShadow = false;
     mesh.receiveShadow = true;
-    // IMPORTANT:
-    // InstancedMesh frustum culling can be incorrect unless the bounding
-    // sphere encloses *all* instances. Because our instances are spread over
-    // many kilometers but the mesh itself sits at the origin, some Three.js
-    // builds will cull the whole batch as if it were a tiny sphere at (0,0,0),
-    // making the entire belt disappear.
-    //
-    // We keep the per-batch *distance* culling (belt.update) for perf and
-    // disable frustum culling to avoid false negatives.
+    // The mesh stays hidden until all instance matrices and aggregate bounds
+    // have been built. Frustum culling is enabled after that calculation.
+    mesh.visible = false;
     mesh.frustumCulled = false;
     meshes[s] = mesh;
     group.add(mesh);
@@ -543,6 +578,11 @@ if (!keepBaseColor) {
       a0,
       a1,
       center: new THREE.Vector3(cx, 0, cz),
+      // x, y, z, radius for each rendered instance. This is substantially
+      // cheaper to query than getMatrixAt() and remains compact (16 bytes/rock).
+      colliders: new Float32Array(count * 4),
+      collisionCenter: new THREE.Vector3(cx, 0, cz),
+      collisionRadius: 0.0,
       built: false,
     };
   }
@@ -555,6 +595,13 @@ if (!keepBaseColor) {
     const count = mesh.count;
 
     const rnd = mulberry32((seed0 ^ (s * 0x9e3779b9)) >>> 0);
+    const colliders = info.colliders;
+    let minX = Infinity;
+    let minY = Infinity;
+    let minZ = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    let maxZ = -Infinity;
 
     for (let i = 0; i < count; i++) {
       // Angle within the segment
@@ -581,7 +628,29 @@ if (!keepBaseColor) {
       dummy.quaternion.setFromAxisAngle(axis, rnd() * Math.PI * 2);
 
       // Non-uniform scaling gives more variety from a single base shape
-      dummy.scale.set(size, size * squash, size * lerp(0.65, 1.25, rnd()));
+      const stretchZ = lerp(0.65, 1.25, rnd());
+      dummy.scale.set(size, size * squash, size * stretchZ);
+
+      // Approximate sphere around the irregular, non-uniformly scaled mesh.
+      // A slight shrink keeps the simple proxy from feeling larger than the
+      // visible rock while still catching the bulk of the silhouette.
+      const collisionRadius =
+        geomCollisionRadius *
+        Math.max(dummy.scale.x, dummy.scale.y, dummy.scale.z) *
+        colliderScale;
+      const ci = i * 4;
+      colliders[ci + 0] = x;
+      colliders[ci + 1] = y;
+      colliders[ci + 2] = z;
+      colliders[ci + 3] = collisionRadius;
+
+      minX = Math.min(minX, x - collisionRadius);
+      minY = Math.min(minY, y - collisionRadius);
+      minZ = Math.min(minZ, z - collisionRadius);
+      maxX = Math.max(maxX, x + collisionRadius);
+      maxY = Math.max(maxY, y + collisionRadius);
+      maxZ = Math.max(maxZ, z + collisionRadius);
+      maxCollisionRadius = Math.max(maxCollisionRadius, collisionRadius);
 
       dummy.updateMatrix();
       mesh.setMatrixAt(i, dummy.matrix);
@@ -598,15 +667,35 @@ if (!keepBaseColor) {
     mesh.instanceMatrix.needsUpdate = true;
     if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
 
-    // Let Three compute a tighter bound per batch so frustum culling works.
+    if (count > 0 && Number.isFinite(minX)) {
+      const center = info.collisionCenter;
+      center.set(
+        (minX + maxX) * 0.5,
+        (minY + maxY) * 0.5,
+        (minZ + maxZ) * 0.5,
+      );
+      const hx = (maxX - minX) * 0.5;
+      const hy = (maxY - minY) * 0.5;
+      const hz = (maxZ - minZ) * 0.5;
+      info.collisionRadius = Math.hypot(hx, hy, hz);
+    }
+
+    // Let Three compute an aggregate bound for this batch. Older Three builds
+    // without InstancedMesh bounds keep the safe distance-culling fallback.
+    let hasAggregateBounds = false;
     try {
-      mesh.computeBoundingSphere?.();
-      mesh.computeBoundingBox?.();
+      if (typeof mesh.computeBoundingSphere === "function") {
+        mesh.computeBoundingSphere();
+        mesh.computeBoundingBox?.();
+        hasAggregateBounds = !!mesh.boundingSphere;
+      }
     } catch (e) {
-      // optional
+      hasAggregateBounds = false;
     }
 
     info.built = true;
+    mesh.frustumCulled = hasAggregateBounds;
+    mesh.visible = true;
     return true;
   }
 
@@ -623,6 +712,199 @@ if (!keepBaseColor) {
     return false;
   }
 
+  // Scratch objects for allocation-free swept-sphere collision queries.
+  const _collisionInvWorld = new THREE.Matrix4();
+  const _collisionStartL = new THREE.Vector3();
+  const _collisionEndL = new THREE.Vector3();
+  const _collisionDeltaL = new THREE.Vector3();
+  const _collisionNormalL = new THREE.Vector3();
+  const _collisionNormalW = new THREE.Vector3();
+
+  /**
+   * Finds the earliest collision between a moving world-space sphere and this
+   * belt's asteroid proxies. `outHit.t` may already contain a hit from another
+   * belt; this method only replaces it when it finds an earlier one.
+   *
+   * Broad phase:
+   *  1. annulus + height slab rejection;
+   *  2. one swept-sphere test against each angular batch bound;
+   *  3. exact swept sphere-vs-sphere only for nearby batch instances.
+   */
+  function sweepSphere(startW, endW, sphereRadius, outHit) {
+    if (
+      !collisionEnabled ||
+      !startW ||
+      !endW ||
+      !outHit ||
+      maxCollisionRadius <= 0.0
+    ) {
+      return false;
+    }
+
+    if (typeof group.updateWorldMatrix === "function") {
+      group.updateWorldMatrix(true, false);
+    } else {
+      group.updateMatrixWorld(true);
+    }
+
+    _collisionInvWorld.copy(group.matrixWorld).invert();
+    _collisionStartL.copy(startW).applyMatrix4(_collisionInvWorld);
+    _collisionEndL.copy(endW).applyMatrix4(_collisionInvWorld);
+    _collisionDeltaL.subVectors(_collisionEndL, _collisionStartL);
+
+    // Convert the world-space query radius conservatively to local space.
+    const me = group.matrixWorld.elements;
+    const sx = Math.hypot(me[0], me[1], me[2]);
+    const sy = Math.hypot(me[4], me[5], me[6]);
+    const sz = Math.hypot(me[8], me[9], me[10]);
+    const minWorldScale = Math.max(1e-6, Math.min(sx, sy, sz));
+    const sphereRadiusL =
+      Math.max(0.0, Number(sphereRadius) || 0.0) / minWorldScale;
+
+    // Very cheap whole-belt rejection against its annular slab.
+    const broadExpand = sphereRadiusL + maxCollisionRadius;
+    const slabHalfHeight = thickness * 0.5 + broadExpand;
+    if (
+      Math.min(_collisionStartL.y, _collisionEndL.y) > slabHalfHeight ||
+      Math.max(_collisionStartL.y, _collisionEndL.y) < -slabHalfHeight
+    ) {
+      return false;
+    }
+
+    const dxz = _collisionEndL.x - _collisionStartL.x;
+    const dzx = _collisionEndL.z - _collisionStartL.z;
+    const xzLenSq = dxz * dxz + dzx * dzx;
+    let closestT = 0.0;
+    if (xzLenSq > 1e-12) {
+      closestT =
+        -(_collisionStartL.x * dxz + _collisionStartL.z * dzx) /
+        xzLenSq;
+      closestT = Math.max(0.0, Math.min(1.0, closestT));
+    }
+    const closestX = _collisionStartL.x + dxz * closestT;
+    const closestZ = _collisionStartL.z + dzx * closestT;
+    const minRadialSq = closestX * closestX + closestZ * closestZ;
+    const startRadialSq =
+      _collisionStartL.x * _collisionStartL.x +
+      _collisionStartL.z * _collisionStartL.z;
+    const endRadialSq =
+      _collisionEndL.x * _collisionEndL.x +
+      _collisionEndL.z * _collisionEndL.z;
+    const maxRadialSq = Math.max(startRadialSq, endRadialSq);
+    const broadInner = Math.max(0.0, innerRadius - broadExpand);
+    const broadOuter = outerRadius + broadExpand;
+    if (
+      maxRadialSq < broadInner * broadInner ||
+      minRadialSq > broadOuter * broadOuter
+    ) {
+      return false;
+    }
+
+    const motionSq = _collisionDeltaL.lengthSq();
+    let bestT = Number.isFinite(outHit.t) ? outHit.t : 1.000001;
+    let bestPenetration = Number.isFinite(outHit.penetration)
+      ? outHit.penetration
+      : 0.0;
+    let changed = false;
+
+    for (let s = 0; s < segments; s++) {
+      const info = segInfo[s];
+      if (!info?.built || info.collisionRadius <= 0.0) continue;
+
+      const batchRadius = info.collisionRadius + sphereRadiusL;
+      if (
+        pointSegmentDistanceSq(
+          info.collisionCenter,
+          _collisionStartL,
+          _collisionEndL,
+        ) >
+        batchRadius * batchRadius
+      ) {
+        continue;
+      }
+
+      const colliders = info.colliders;
+      for (let i = 0; i < colliders.length; i += 4) {
+        const cx = colliders[i + 0];
+        const cy = colliders[i + 1];
+        const cz = colliders[i + 2];
+        const combinedRadius = colliders[i + 3] + sphereRadiusL;
+
+        const mx = _collisionStartL.x - cx;
+        const my = _collisionStartL.y - cy;
+        const mz = _collisionStartL.z - cz;
+        const startDistSq = mx * mx + my * my + mz * mz;
+        const c = startDistSq - combinedRadius * combinedRadius;
+
+        let hitT = 0.0;
+        let penetrationL = 0.0;
+        const startedInside = c <= 0.0;
+
+        if (startedInside) {
+          penetrationL =
+            combinedRadius - Math.sqrt(Math.max(0.0, startDistSq));
+        } else {
+          if (motionSq <= 1e-12) continue;
+          const b =
+            mx * _collisionDeltaL.x +
+            my * _collisionDeltaL.y +
+            mz * _collisionDeltaL.z;
+          if (b >= 0.0) continue;
+
+          const discriminant = b * b - motionSq * c;
+          if (discriminant < 0.0) continue;
+
+          hitT = (-b - Math.sqrt(discriminant)) / motionSq;
+          if (hitT < 0.0 || hitT > 1.0) continue;
+        }
+
+        const penetrationW = penetrationL * minWorldScale;
+        const isEarlier = hitT < bestT - 1e-7;
+        const isDeeperAtSameTime =
+          Math.abs(hitT - bestT) <= 1e-7 &&
+          penetrationW > bestPenetration + 1e-6;
+        if (!isEarlier && !isDeeperAtSameTime) continue;
+
+        if (startedInside) {
+          _collisionNormalL.set(mx, my, mz);
+        } else {
+          _collisionNormalL.set(
+            _collisionStartL.x + _collisionDeltaL.x * hitT - cx,
+            _collisionStartL.y + _collisionDeltaL.y * hitT - cy,
+            _collisionStartL.z + _collisionDeltaL.z * hitT - cz,
+          );
+        }
+
+        if (_collisionNormalL.lengthSq() <= 1e-12) {
+          if (motionSq > 1e-12) {
+            _collisionNormalL.copy(_collisionDeltaL).multiplyScalar(-1.0);
+          } else {
+            _collisionNormalL.set(0, 1, 0);
+          }
+        }
+        _collisionNormalL.normalize();
+        _collisionNormalW
+          .copy(_collisionNormalL)
+          .transformDirection(group.matrixWorld);
+
+        if (!outHit.normal) outHit.normal = new THREE.Vector3();
+        outHit.t = hitT;
+        outHit.penetration = penetrationW;
+        outHit.startedInside = startedInside;
+        outHit.normal.copy(_collisionNormalW);
+        outHit.belt = belt;
+        outHit.segmentIndex = s;
+        outHit.instanceIndex = i >> 2;
+
+        bestT = hitT;
+        bestPenetration = penetrationW;
+        changed = true;
+      }
+    }
+
+    return changed;
+  }
+
   function update(focusPos, t = 0.0) {
     if (!focusPos) return;
     // Quick distance culling: hide batches that are far from the player.
@@ -636,7 +918,7 @@ if (!keepBaseColor) {
       const dx = fx - c.x;
       const dz = fz - c.z;
       const d2 = dx * dx + dz * dz;
-      meshes[s].visible = d2 <= maxD2;
+      meshes[s].visible = info.built && d2 <= maxD2;
     }
 
     // Animate dust volume subtly.
@@ -703,10 +985,13 @@ if (!keepBaseColor) {
       cosmicDust,
       dustRing,
       dustOpacity,
+      collisionEnabled,
+      collisionRadiusScale: colliderScale,
     },
     buildSegment,
     buildAll,
     buildNext,
+    sweepSphere,
     update,
     dispose,
   };
@@ -799,9 +1084,12 @@ export function createPlanetRing({
     const d2 = dx * dx + dy * dy + dz * dz;
     const maxD2 = maxVisibleDist * maxVisibleDist;
     ring.group.visible = d2 <= maxD2;
-    // Keep segment meshes enabled when visible (frustum culling is off intentionally).
+    // Keep built segment meshes enabled when close enough; frustum culling then
+    // rejects the angular batches outside the camera view.
     if (ring.group.visible) {
-      for (let i = 0; i < ring.meshes.length; i++) ring.meshes[i].visible = true;
+      for (let i = 0; i < ring.meshes.length; i++) {
+        ring.meshes[i].visible = !!ring.segInfo[i]?.built;
+      }
     }
     // (No dust mesh/volume for rings.)
   };

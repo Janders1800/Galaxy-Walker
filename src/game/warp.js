@@ -104,52 +104,77 @@ export function resizeWarpOverlayLegacy(warpMat, w, h) {
 export function makeChargeUI(chargeUIEl) {
     const el = chargeUIEl;
 
-    // Fixed-length bar that fills outward from the center.
-    // Keep this even so the center is between two characters.
-    const BAR_LEN = 28;
-    const HALF = BAR_LEN / 2;
-
-    function makeCenterFillBar(progress01) {
-        const p = Math.max(0, Math.min(1, progress01));
-
-        // Fill symmetrically; keep the fill even for nice centering.
-        let filled = Math.round(p * BAR_LEN);
-        if (filled % 2 === 1) filled -= 1;
-        filled = Math.max(0, Math.min(BAR_LEN, filled));
-
-        const side = filled / 2;
-        const pad = HALF - side;
-        return (
-            " ".repeat(pad) +
-            "|".repeat(side) +
-            "|".repeat(side) +
-            " ".repeat(pad)
-        );
+    if (!el) {
+        const noop = () => {};
+        return { setCharging: noop, setCountdown: noop, hide: noop };
     }
 
+    el.replaceChildren();
+
+    const topLine = document.createElement("div");
+    topLine.className = "chargeTopline";
+    const systemLabel = document.createElement("span");
+    systemLabel.textContent = "FTL DRIVE // CHARGE ARRAY";
+    const statusLabel = document.createElement("span");
+    statusLabel.textContent = "STANDBY";
+    topLine.append(systemLabel, statusLabel);
+
+    const main = document.createElement("div");
+    main.className = "chargeMain";
+    const label = document.createElement("span");
+    label.className = "chargeLabel";
+    label.textContent = "WARP CAPACITOR";
+    const value = document.createElement("span");
+    value.className = "chargeValue";
+    value.textContent = "000%";
+    main.append(label, value);
+
+    const track = document.createElement("div");
+    track.className = "chargeTrack";
+    const fillLeft = document.createElement("i");
+    fillLeft.className = "chargeFillLeft";
+    const fillRight = document.createElement("i");
+    fillRight.className = "chargeFillRight";
+    track.append(fillLeft, fillRight);
+
+    const meta = document.createElement("div");
+    meta.className = "chargeMeta";
+    const metaLeft = document.createElement("span");
+    metaLeft.textContent = "PHASE COHERENCE";
+    const metaRight = document.createElement("span");
+    metaRight.textContent = "VECTOR LOCK";
+    meta.append(metaLeft, metaRight);
+
+    el.append(topLine, main, track, meta);
+
     function setCharging(progress01) {
-        const bar = makeCenterFillBar(progress01);
-        el.textContent = `CHARGING\n[${bar}]`;
+        const p = Math.max(0, Math.min(1, progress01));
+        el.style.setProperty("--charge-half-progress", `${(p * 50).toFixed(2)}%`);
+        label.textContent = "WARP CAPACITOR";
+        value.textContent = `${Math.round(p * 100).toString().padStart(3, "0")}%`;
+        statusLabel.textContent = p >= 0.995 ? "CHARGED" : "CHARGING";
+        metaRight.textContent = p >= 0.995 ? "VECTOR LOCKED" : "VECTOR LOCK";
+        el.classList.remove("countdown");
         el.classList.add("on");
     }
 
     function setCountdown(secondsLeft) {
-        // Countdown replaces the "CHARGING" line, but the bar stays visible.
-        // Display format: seconds:hundredths (e.g., 300:00 for 5 minutes).
         const remainingHund = Math.max(0, Math.ceil(secondsLeft * 100));
         const secs = Math.floor(remainingHund / 100);
         const hund = remainingHund % 100;
-
         const sStr = secs.toString().padStart(2, "0");
         const hStr = hund.toString().padStart(2, "0");
 
-        const inside = "|".repeat(BAR_LEN);
-        el.textContent = `${sStr}:${hStr}\n[${inside}]`;
-        el.classList.add("on");
+        el.style.setProperty("--charge-half-progress", "50%");
+        label.textContent = "JUMP WINDOW";
+        value.textContent = `${sStr}:${hStr}`;
+        statusLabel.textContent = "COMMITTED";
+        metaRight.textContent = "VECTOR LOCKED";
+        el.classList.add("countdown", "on");
     }
 
     function hide() {
-        el.classList.remove("on");
+        el.classList.remove("on", "countdown");
     }
 
     return { setCharging, setCountdown, hide };
@@ -503,13 +528,22 @@ export function makeWarpController({
     integratePosition, // (dt) => void
     interpolateLookAt, // (p01, dirW, dt) => void
 }) {
+    const flashOverlay = document.getElementById("warpFlashOverlay");
+
+    function setFlash(value) {
+        const v = THREE.MathUtils.clamp(value, 0.0, 1.0);
+        if (warpMat.uniforms.uFlash) warpMat.uniforms.uFlash.value = v;
+        if (flashOverlay) flashOverlay.style.opacity = String(v);
+    }
+
     const warp = {
         active: false,
-        phase: "idle", // idle | charge | countdown | travel | out | reveal
+        phase: "idle", // idle | charge | countdown | entryFlash | travel | out | exitFlash | reveal
         target: null,
 
         chargeT: 0,
         countdownT: 0,
+        flashT: 0,
         travelT: 0,
         outT: 0,
         revealT: 0,
@@ -517,8 +551,10 @@ export function makeWarpController({
         // Timings
         chargeDur: 15.0,
         countdownDur: 5.99,
+        entryFlashDur: 0.32,
         travelDur: 15.0,
         outDur: 1.2,
+        exitFlashDur: 0.28,
         revealDur: 0.25,
 
         dirW: new THREE.Vector3(0, 0, -1),
@@ -535,6 +571,7 @@ export function makeWarpController({
         warp.phase = "charge";
         warp.chargeT = 0;
         warp.countdownT = 0;
+        warp.flashT = 0;
         warp.travelT = 0;
         warp.outT = 0;
         warp.revealT = 0;
@@ -544,6 +581,7 @@ export function makeWarpController({
 
         warpMat.uniforms.uStrength.value = 0.0;
         warpMat.uniforms.uFade.value = 0.0;
+        setFlash(0.0);
 
         onWarpStart?.(target);
         chargeUI.setCharging(0);
@@ -554,6 +592,19 @@ export function makeWarpController({
         }
         warp._lastBeepSec = 6;
         return true;
+    }
+
+    function flashEnvelope(t, duration) {
+        const p = THREE.MathUtils.clamp(t / Math.max(duration, 0.001), 0, 1);
+        // Fast ignition, longer smooth decay. Reaches true full white near the
+        // start of the pulse instead of behaving like a slow cross-fade.
+        if (p < 0.14) {
+            return THREE.MathUtils.smoothstep(p / 0.14, 0.0, 1.0);
+        }
+        // Brief guaranteed full-white plateau so even ordinary 60 Hz frame
+        // timing cannot step over the brightest instant.
+        if (p < 0.24) return 1.0;
+        return 1.0 - THREE.MathUtils.smoothstep((p - 0.24) / 0.76, 0.0, 1.0);
     }
 
     function update(dt, timeSeconds) {
@@ -623,26 +674,59 @@ export function makeWarpController({
                 //chargeSound?.beepFinal?.();
                 chargeSound?.stop?.();
 
-                warp.phase = "travel";
-                warp.travelT = 0;
+                warp.phase = "entryFlash";
+                warp.flashT = 0;
                 chargeUI.hide();
                 warpMat.uniforms.uStrength.value = 0.0;
                 warpMat.uniforms.uFade.value = 0.0;
+                setFlash(0.0);
 
-                // Hide minimap during warp
-                document
-                    .getElementById("galaxyMap")
+                // Hide minimap before the flash/tunnel sequence begins.
+                const galaxyMap = document.getElementById("galaxyMap");
+                galaxyMap?.classList.add("warpHide");
+                galaxyMap
+                    ?.closest?.("#galaxyMapShell")
                     ?.classList.add("warpHide");
             }
-        } else if (warp.phase === "travel") {
-            warp.travelT += dt;
+        } else if (warp.phase === "entryFlash") {
+            warp.flashT += dt;
 
-            // Ramp the overlay in quickly
-            const ramp = THREE.MathUtils.clamp(
-                warp.travelT / 0.35,
+            const flashP = THREE.MathUtils.clamp(
+                warp.flashT / Math.max(warp.entryFlashDur, 0.001),
                 0,
                 1,
             );
+            const flash = flashEnvelope(warp.flashT, warp.entryFlashDur);
+
+            // Bring the tunnel up underneath the white flash instead of waiting
+            // for the flash to finish. It starts while the screen is still near
+            // full white and reaches full strength exactly as the flash clears,
+            // so there is never an exposed frame between the two effects.
+            const tunnelRamp = THREE.MathUtils.smoothstep(
+                THREE.MathUtils.clamp((flashP - 0.18) / 0.82, 0, 1),
+                0,
+                1,
+            );
+            warpMat.uniforms.uStrength.value = tunnelRamp;
+            warpMat.uniforms.uFade.value = tunnelRamp;
+            setFlash(flash);
+
+            if (integratePosition) integratePosition(dt);
+
+            if (warp.flashT >= warp.entryFlashDur) {
+                warp.phase = "travel";
+                warp.travelT = 0;
+                setFlash(0.0);
+                warpMat.uniforms.uStrength.value = 1.0;
+                warpMat.uniforms.uFade.value = 1.0;
+            }
+        } else if (warp.phase === "travel") {
+            warp.travelT += dt;
+            setFlash(0.0);
+
+            // The entry flash has already ramped the tunnel to full strength.
+            // Do not restart from zero here or a visible gap appears.
+            const ramp = 1.0;
             warpMat.uniforms.uStrength.value = ramp;
             warpMat.uniforms.uFade.value = 1.0;
 
@@ -668,6 +752,7 @@ export function makeWarpController({
             }
         } else if (warp.phase === "out") {
             warp.outT += dt;
+            setFlash(0.0);
             const k = THREE.MathUtils.clamp(
                 warp.outT / warp.outDur,
                 0,
@@ -681,14 +766,33 @@ export function makeWarpController({
             if (integratePosition) integratePosition(dt);
 
             if (k >= 1.0) {
-                // Hold black for a beat, then fade back in cleanly to avoid camera-angle pops
+                // The tunnel is gone; flash once before revealing the rebuilt system.
+                // Keep the black transition underneath so camera/system swaps can never
+                // peek through the tail of the flash.
+                warp.phase = "exitFlash";
+                warp.flashT = 0;
+                warpMat.uniforms.uStrength.value = 0.0;
+                warpMat.uniforms.uFade.value = 1.0;
+                setFlash(0.0);
+            }
+        } else if (warp.phase === "exitFlash") {
+            warp.flashT += dt;
+            warpMat.uniforms.uStrength.value = 0.0;
+            warpMat.uniforms.uFade.value = 1.0;
+            setFlash(flashEnvelope(warp.flashT, warp.exitFlashDur));
+
+            if (integratePosition) integratePosition(dt);
+
+            if (warp.flashT >= warp.exitFlashDur) {
                 warp.phase = "reveal";
                 warp.revealT = 0;
+                setFlash(0.0);
                 warpMat.uniforms.uStrength.value = 0.0;
                 warpMat.uniforms.uFade.value = 1.0;
             }
         } else if (warp.phase === "reveal") {
             warp.revealT += dt;
+            setFlash(0.0);
             const k = THREE.MathUtils.clamp(
                 warp.revealT / warp.revealDur,
                 0,
@@ -704,12 +808,15 @@ export function makeWarpController({
                 warp.active = false;
                 warp.phase = "idle";
                 // Restore minimap after warp
-                document
-                    .getElementById("galaxyMap")
+                const galaxyMap = document.getElementById("galaxyMap");
+                galaxyMap?.classList.remove("warpHide");
+                galaxyMap
+                    ?.closest?.("#galaxyMapShell")
                     ?.classList.remove("warpHide");
                 warp.target = null;
                 warpMat.uniforms.uStrength.value = 0.0;
                 warpMat.uniforms.uFade.value = 0.0;
+                setFlash(0.0);
             }
         }
     }
@@ -717,9 +824,18 @@ export function makeWarpController({
     function isOverlayVisible() {
         return (
             warp.active &&
-            (warp.phase === "travel" ||
+            (warp.phase === "entryFlash" ||
+                warp.phase === "travel" ||
                 warp.phase === "out" ||
+                warp.phase === "exitFlash" ||
                 warp.phase === "reveal")
+        );
+    }
+
+    function isFlashActive() {
+        return (
+            warp.active &&
+            (warp.phase === "entryFlash" || warp.phase === "exitFlash")
         );
     }
 
@@ -732,6 +848,7 @@ export function makeWarpController({
         start,
         update,
         isOverlayVisible,
+        isFlashActive,
         isMovementLocked,
     };
 }

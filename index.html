@@ -3,7 +3,8 @@
     <head>
         <meta charset="utf-8" />
         <meta name="viewport" content="width=device-width,initial-scale=1" />
-        <title>Galaxy Walker Demo</title>
+        <title>Galaxy Walker // Flight Computer</title>
+        <meta name="theme-color" content="#02070b" />
         <link rel="icon" href="./favicon.ico" />
         <link rel="stylesheet" href="./styles.css" />
 
@@ -18,16 +19,48 @@
         </script>
     </head>
     <body class="prestart">
+        <div id="warpFlashOverlay" aria-hidden="true"></div>
         <div id="hud">
+            <div class="hudTopline" aria-hidden="true"></div>
             <div id="hudStats">
-                <div id="msg"></div>
-                <button id="hudOptionsBtn" class="hudBtn" type="button">
-                    Options
-                </button>
+                <div id="hudTelemetry" aria-label="Flight telemetry"></div>
+                <div id="msg" aria-live="polite"></div>
+                <div class="hudQuickActions" aria-label="Quick systems controls">
+                    <button id="hudOptionsBtn" class="hudBtn" type="button">
+                        Systems
+                    </button>
+                </div>
             </div>
         </div>
         <div id="chargeUI"></div>
+        <div id="landingUI" aria-live="polite" aria-hidden="true">
+            <div class="landingSequenceLabel">Landing sequence</div>
+        </div>
+        <div id="gasGiantWarning" role="alert" aria-live="assertive" aria-hidden="true">
+            <div class="gasGiantWarningIcon" aria-hidden="true">!</div>
+            <div class="gasGiantWarningCopy">
+                <strong>WARNING</strong>
+                <span>SHIELD OVERLOAD</span>
+            </div>
+        </div>
         <div id="fps">FPS: --</div>
+        <div id="flightHud" aria-hidden="true">
+            <div class="flightHudAttitude" aria-hidden="true">
+                <div id="flightHudLadder" class="flightHudLadder">
+                    <div class="flightHudPitch p0"><i></i></div>
+                </div>
+                <div class="flightHudAircraft"><i></i><b></b><i></i></div>
+            </div>
+            <div class="flightHudReadout flightHudSpeed"><span>SPD</span><strong id="flightHudSpeedValue">0 m/s</strong></div>
+            <div class="flightHudReadout flightHudAltitude"><span>ALT</span><strong id="flightHudAltitudeValue">—</strong></div>
+        </div>
+
+        <div id="cockpitFrame" aria-hidden="true">
+            <i class="frameCorner tl"></i>
+            <i class="frameCorner tr"></i>
+            <i class="frameCorner bl"></i>
+            <i class="frameCorner br"></i>
+        </div>
 
         <!-- MassiveEngine splash (fade in/out, then main menu) -->
         <div id="splashOverlay">
@@ -77,11 +110,11 @@
                     </div>
 
                     <div class="menuButtons">
-                        <button id="startBtn" class="menuBtn primary">
+                        <button id="startBtn" class="menuBtn primary" data-code="01">
                             Begin
                         </button>
-                        <button id="optionsBtn" class="menuBtn">Options</button>
-                        <button id="extrasBtn" class="menuBtn">Controls</button>
+                        <button id="optionsBtn" class="menuBtn" data-code="02">Options</button>
+                        <button id="extrasBtn" class="menuBtn" data-code="03">Controls</button>
                     </div>
 
                     <div
@@ -138,13 +171,14 @@
                             id="optionsBackBtn"
                             class="menuBtn backBtn"
                             type="button"
+                            data-code="ESC"
                         >
                             Back
                         </button>
                     </div>
 
                     <div style="flex: 1"></div>
-                    <div class="menuHint">Press <b>Enter</b> to Begin</div>
+                    <div class="menuHint"><b>[ Enter ]</b> Initialize simulation</div>
                 </div>
 
                 <div class="menuBand" aria-hidden="true"></div>
@@ -231,7 +265,10 @@
 
         <!-- Loading overlay (shown after Begin) -->
         <div id="loadingOverlay" class="off" aria-live="polite">
-            <div class="txt">Loading...</div>
+            <div class="loadingCore">
+                <div class="txt">Generating star system</div>
+                <div class="loadingTrack" aria-hidden="true"><i></i></div>
+            </div>
         </div>
 
         <!-- Controls modal (2 columns) -->
@@ -244,7 +281,9 @@
         >
             <div class="panel">
                 <div class="topbar">
-                    <h2 id="controlsTitle">Controls</h2>
+                    <div>
+                        <h2 id="controlsTitle">Controls</h2>
+                    </div>
                     <button id="controlsClose" aria-label="Close">✕</button>
                 </div>
                 <div class="cols">
@@ -253,13 +292,14 @@
                         <ul>
                             <li><b>Click</b> — pointer lock</li>
                             <li><b>Mouse</b> — look</li>
-                            <li><b>WASD</b> — move (walk/fly)</li>
-                            <li><b>Shift</b> — boost/sprint</li>
-                            <li><b>Space</b> — jump / up thrust</li>
+                            <li><b>WASD</b> — move / drive / fly</li>
+                            <li><b>Shift</b> — boost / sprint / rover boost</li>
+                            <li><b>Space</b> — jump / rover jump jets / up thrust</li>
                             <li><b>Ctrl</b> — down thrust (fly)</li>
                             <li><b>Q / E</b> — roll (fly)</li>
                             <li><b>F</b> — take off</li>
                             <li><b>L</b> — land nearest</li>
+                            <li><b>V</b> — deploy / enter / exit surface rover</li>
                             <li><b>R</b> — respawn</li>
                             <li><b>M</b> — toggle mini map</li>
                             <li><b>+</b> / <b>-</b> — zoom mini map</li>
@@ -281,13 +321,7 @@
                             </li>
                             <li><b>LT / RT</b> — down / up thrust (fly)</li>
                         </ul>
-                        <div
-                            style="
-                                opacity: 0.75;
-                                font-size: 12px;
-                                margin-top: 8px;
-                            "
-                        >
+                        <div class="controlsNote">
                             Note: some UI toggles are keyboard-only for now (map
                             / warp UI).
                         </div>
@@ -295,14 +329,29 @@
                 </div>
             </div>
         </div>
-        <div id="crosshair"></div>
-        <canvas id="galaxyMap"></canvas>
+        <div id="crosshair" aria-hidden="true"><span></span></div>
+        <div id="galaxyMapShell">
+            <div class="miniMapHeader">Local Map</div>
+            <canvas id="galaxyMap"></canvas>
+            <i class="mapBracket tl"></i>
+            <i class="mapBracket tr"></i>
+            <i class="mapBracket bl"></i>
+            <i class="mapBracket br"></i>
+        </div>
 
         <div id="galaxyOverlay" class="off">
             <canvas id="galaxyFull"></canvas>
+            <i class="galaxyMapCorner tl" aria-hidden="true"></i>
+            <i class="galaxyMapCorner tr" aria-hidden="true"></i>
+            <i class="galaxyMapCorner bl" aria-hidden="true"></i>
+            <i class="galaxyMapCorner br" aria-hidden="true"></i>
             <div id="galaxyOverlayHud">
-                <b>GALAXY MAP</b> — Drag: pan • Wheel: zoom • Click: select •
-                Double-click: warp • Enter: center on player • Esc/G: close
+                <span class="galaxyHudTitle">Galaxy Map</span>
+                <span class="galaxyHudControls">Drag pan · Wheel zoom · Click select · Double-click engage warp · Enter recenter · Esc/G close</span>
+            </div>
+            <div class="galaxyOverlayStatus">
+                <strong id="galaxyTargetStatus">No target selected</strong>
+                <span id="galaxyWarpStatus">Select a star</span>
             </div>
         </div>
 

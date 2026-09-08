@@ -5,7 +5,7 @@
 // Usage:
 //   import { createGasGiantMaterial, updateGasGiant } from "./gasGiantMaterial.js";
 //   const { material, uniforms, randomizeStrip } = createGasGiantMaterial({ seed: 123 });
-//   const mesh = new THREE.Mesh(new THREE.SphereGeometry(1, 192, 192), material);
+//   const mesh = new THREE.Mesh(new THREE.SphereGeometry(1, 96, 48), material);
 //   scene.add(mesh);
 //   // in your render loop:
 //   updateGasGiant(uniforms, camera, clock.getElapsedTime());
@@ -13,6 +13,11 @@
 // Optional: call randomizeStrip() any time to change the predominant color family.
 
 import { THREE } from "../render/device.js";
+import {
+  VOLUME_NOISE_GLSL,
+  createVolumeNoiseAtlas,
+  makeVolumeNoiseUniforms,
+} from "../render/noiseTextures.js";
 
 // Deterministic RNG (so gas-giant strip can be stable per-seed)
 function mulberry32(seed) {
@@ -41,12 +46,19 @@ export function createGasGiantMaterial(options = {}) {
     // lighting params (kept from your original naming)
     colStar = new THREE.Vector3(1.0, 0.7, 0.5),
     posStar = new THREE.Vector3(0.0, 9.0, 30.0),
+    sunRadius = 1350.0,
+    eclipseAmbientFloor = 0.12,
 
     // internal texture
     stripHeight = 256,
 
     // deterministic strip option
     seed = 0,
+
+    // Shared texture-backed 3D noise. The world supplies one atlas to every
+    // volumetric material; standalone callers receive a deterministic fallback.
+    volumeNoiseTexture = null,
+    volumeNoiseLayout = null,
   } = options;
 
   const rand = mulberry32((seed ?? 0) >>> 0);
@@ -117,7 +129,13 @@ export function createGasGiantMaterial(options = {}) {
     return tex;
   }
 
+  const volumeNoise =
+    volumeNoiseTexture && volumeNoiseLayout
+      ? { texture: volumeNoiseTexture, layout: volumeNoiseLayout }
+      : createVolumeNoiseAtlas(THREE, ((seed ?? 0) ^ 0x6a09e667) >>> 0);
+
   const uniforms = {
+    ...makeVolumeNoiseUniforms(THREE, volumeNoise.texture, volumeNoise.layout),
     iTime: { value: 0.0 },
     iChannel0: { value: makeChannel0Strip(stripHeight) },
 
@@ -139,6 +157,10 @@ export function createGasGiantMaterial(options = {}) {
     // eclipse (shared system)
     uPlanetCenterW: { value: new THREE.Vector3() },
     uSunPosW: { value: new THREE.Vector3() },
+    uSunRadius: { value: Math.max(0.0, sunRadius) },
+    uEclipseAmbientFloor: {
+      value: THREE.MathUtils.clamp(eclipseAmbientFloor, 0.0, 1.0),
+    },
     uOccCount: { value: 0 },
     uOccCenters: { value: new Float32Array(24 * 3) },
     uOccRadii: { value: new Float32Array(24) },
@@ -190,6 +212,8 @@ export function createGasGiantMaterial(options = {}) {
     // Eclipse uniforms (ONLY addition)
     uniform vec3 uPlanetCenterW;
     uniform vec3 uSunPosW;
+    uniform float uSunRadius;
+    uniform float uEclipseAmbientFloor;
     uniform int   uOccCount;
     uniform vec3  uOccCenters[24];
     uniform float uOccRadii[24];
@@ -200,89 +224,39 @@ export function createGasGiantMaterial(options = {}) {
     varying vec3 vWorldNormal;
     varying vec3 vObjPos;
 
-    float hash(float n) { return fract(sin(n) * 123.456789); }
-
-    float noise(in vec3 p){
-      vec3 fl = floor(p);
-      vec3 fr = fract(p);
-      fr = fr * fr * (3.0 - 2.0 * fr);
-
-      float n = fl.x + fl.y * 157.0 + 113.0 * fl.z;
-      return mix(
-        mix(
-          mix(hash(n +   0.0), hash(n +   1.0), fr.x),
-          mix(hash(n + 157.0), hash(n + 158.0), fr.x), fr.y
-        ),
-        mix(
-          mix(hash(n + 113.0), hash(n + 114.0), fr.x),
-          mix(hash(n + 270.0), hash(n + 271.0), fr.x), fr.y
-        ), fr.z
-      );
-    }
-
-    float fbm3(vec3 p){
-      float f = 0.0;
-      float a = 0.5;
-      for(int i=0;i<5;i++){
-        f += a * noise(p);
-        p *= 2.02;
-        a *= 0.5;
-      }
-      return f;
-    }
-
-    vec3 gradFbm(vec3 p){
-      float e = 0.12;
-      float fx1 = fbm3(p + vec3(e,0,0));
-      float fx0 = fbm3(p - vec3(e,0,0));
-      float fy1 = fbm3(p + vec3(0,e,0));
-      float fy0 = fbm3(p - vec3(0,e,0));
-      float fz1 = fbm3(p + vec3(0,0,e));
-      float fz0 = fbm3(p - vec3(0,0,e));
-      return vec3(fx1 - fx0, fy1 - fy0, fz1 - fz0) / (2.0 * e);
-    }
-
-    vec3 sphereField(vec3 p, float t){
-      vec3 g1 = gradFbm(p * 2.0 + vec3(0.0, t*0.4, t*0.2));
-      vec3 g2 = gradFbm(p * 4.0 + vec3(t*0.15, 0.0, -t*0.1));
-      vec3 f = normalize(g1 + 0.6 * g2);
-
-      // project onto tangent plane (seamless)
-      f -= p * dot(p, f);
-      return normalize(f + 1e-6);
-    }
+    ${VOLUME_NOISE_GLSL}
 
     vec3 distortSphere(vec3 p){
-      const int MAX_IT = 12;
-      int it = clamp(distort_iterations, 1, MAX_IT);
       float t = time_scale * iTime;
-
-      for(int i=0;i<MAX_IT;i++){
-        if(i >= it) break;
-        vec3 f = sphereField(p, t + float(i) * 0.7);
-        p = normalize(p + f * (warp_strength / float(it)));
-      }
-      return p;
+      vec4 macroNoise = sampleVolumeNoise(
+        p * 0.31 + vec3(t * 0.013, -t * 0.009, t * 0.017)
+      );
+      vec3 warp = macroNoise.rgb * 2.0 - 1.0;
+      warp -= p * dot(p, warp);
+      return normalize(p + warp * warp_strength * 0.42);
     }
 
     vec3 doMaterial(vec3 pos){
       vec3 p = distortSphere(pos);
+      float t = time_scale * iTime;
 
-      // gas-giant bands mainly from latitude (p.y)
+      vec4 macroNoise = sampleVolumeNoise(
+        p * 0.47 + vec3(-t * 0.011, t * 0.007, t * 0.015)
+      );
+      vec4 detailNoise = sampleVolumeNoise(
+        p * 1.23 + vec3(t * 0.019, -t * 0.013, t * 0.009)
+      );
+
+      float turbulence = dot(macroNoise, vec4(0.48, 0.27, 0.17, 0.08));
+      float fine = mix(detailNoise.b, detailNoise.a, 0.45);
       float bands = p.y * band_scale;
+      float y = bands +
+        (turbulence - 0.5) * (2.6 * detail_strength) +
+        (fine - 0.5) * (0.9 * detail_strength);
 
-      // turbulence/detail (seamless because it uses 3D p)
-      float turb = fbm3(p * 6.0  + vec3(0.0, iTime*0.15, iTime*0.05));
-      float fine = fbm3(p * 14.0 + vec3(iTime*0.2, 0.0, -iTime*0.12));
-
-      float y = bands + turb * (2.2 * detail_strength) + fine * (0.8 * detail_strength);
-
-      // 1D strip sample (x=0), y repeated
-      vec3 s = 2.5 * texture2D(iChannel0, vec2(0.0, y * tex_scale)).xyz;
-
-      // intensity modulation, similar spirit to original
-      float m = 0.55 + 0.45 * fbm3(p * 3.0);
-      return s * m;
+      vec3 strip = 2.5 * texture2D(iChannel0, vec2(0.0, y * tex_scale)).xyz;
+      float modulation = 0.62 + 0.42 * mix(macroNoise.g, detailNoise.r, 0.35);
+      return strip * modulation;
     }
 
     vec3 doLighting(in vec3 n, in vec3 c, in vec3 rd, in vec3 rdc){
@@ -311,28 +285,52 @@ export function createGasGiantMaterial(options = {}) {
     }
 
     float sunVisibility(vec3 pW, vec3 sunPosW){
-      vec3 rd = normalize(sunPosW - pW);
-      float maxT = length(sunPosW - pW);
+      vec3 toSun = sunPosW - pW;
+      float sunDistance = length(toSun);
+      if(sunDistance <= 1e-5) return 1.0;
+      vec3 sunDirection = toSun / sunDistance;
+      float visibility = 1.0;
 
-      float vis = 1.0;
       for(int i=0; i<24; i++){
         if(i >= uOccCount) break;
-        float tHit = raySphereHit(pW, rd, uOccCenters[i], uOccRadii[i]);
-        if(tHit < maxT){
-          vec3 oc = pW - uOccCenters[i];
-          float b = dot(oc, rd);
-          float d2 = dot(oc, oc) - b*b;
-          float d = sqrt(max(d2, 0.0));
-          float r = uOccRadii[i];
+        float occR = max(0.0, uOccRadii[i]);
+        if(occR <= 0.0) continue;
 
-          // Soft penumbra: transition on both sides of the geometric edge.
-          float w = r * uEclipseSoftness;
-          float edge = smoothstep(r - w, r + w, d);
-          vis = min(vis, edge);
+        vec3 toOcc = uOccCenters[i] - pW;
+        float along = dot(toOcc, sunDirection);
+        if(along <= 0.0 || along >= sunDistance) continue;
+
+        float perp = length(toOcc - sunDirection * along);
+        if(perp <= occR){
+          visibility = 0.0;
+          break;
         }
+
+        float projectedSunRadius = max(
+          uSunRadius * (along / sunDistance),
+          occR * max(uEclipseSoftness, 0.0001)
+        );
+        float outer = occR + projectedSunRadius;
+        if(perp >= outer) continue;
+
+        float inner = abs(occR - projectedSunRadius);
+        float overlap = 1.0 - smoothstep(
+          inner,
+          max(inner + 1e-4, outer),
+          perp
+        );
+        float maxCoverage = occR >= projectedSunRadius
+          ? 1.0
+          : clamp(
+              (occR * occR) / max(1e-5, projectedSunRadius * projectedSunRadius),
+              0.0,
+              1.0
+            );
+
+        visibility = min(visibility, 1.0 - overlap * maxCoverage);
       }
 
-      return mix(1.0, vis, clamp(uEclipseStrength, 0.0, 1.0));
+      return mix(1.0, visibility, clamp(uEclipseStrength, 0.0, 1.0));
     }
 
     void main(){
@@ -354,7 +352,14 @@ export function createGasGiantMaterial(options = {}) {
 
       // Eclipse dimming (ONLY addition)
       float vis = sunVisibility(vWorldPos, uSunPosW);
-      float eclipseDim = mix(1.0, 0.45, 1.0 - vis);
+      // Direct gas-giant illumination now follows the same eclipse visibility
+      // as solid materials. Retain only the same small indirect/scattered fill
+      // floor used by the unified SPL path instead of the old 45% totality glow.
+      float eclipseDim = mix(
+        clamp(uEclipseAmbientFloor, 0.0, 1.0),
+        1.0,
+        vis
+      );
       vec3 upP = normalize(vWorldPos - uPlanetCenterW);
       vec3 sunDir = normalize(uSunPosW - uPlanetCenterW);
       float ndl0 = dot(upP, sunDir);
@@ -391,12 +396,11 @@ export function createGasGiantMaterial(options = {}) {
   return { material, uniforms, randomizeStrip };
 }
 
+const _cameraForward = new THREE.Vector3();
+
 // Call this each frame
 export function updateGasGiant(uniforms, camera, timeSeconds) {
   uniforms.iTime.value = timeSeconds;
-
-  // camera forward vector (world)
-  const fwd = new THREE.Vector3();
-  camera.getWorldDirection(fwd);
-  uniforms.cam_forward.value.copy(fwd);
+  camera.getWorldDirection(_cameraForward);
+  uniforms.cam_forward.value.copy(_cameraForward);
 }

@@ -4,6 +4,7 @@ import {
   createFullscreenTri,
   createCopyPass,
   createAtmoCopyPass,
+  createTextureCompositePass,
   createUnderwaterPost,
   createGodRaysPass,
   ATMO_VS,
@@ -22,6 +23,14 @@ import {
   clearSPLMaterialRegistry,
   splMaskedMaterials,
 } from "../game/spl.js";
+
+import {
+  createVolumeNoiseAtlas,
+  makeVolumeNoiseUniforms,
+  createCloudNoiseAtlas,
+  makeCloudNoiseUniforms,
+  VOLUME_NOISE_SIZE,
+} from "../render/noiseTextures.js";
 
 import { QuadSphereBody, terrainPool } from "../game/terrain/quadsphere.js";
 import { createAsteroidBelt, createPlanetRing } from "../game/asteroidBelt.js";
@@ -148,26 +157,33 @@ export function createWorld({ seed, preset } = {}) {
     qualitySel && QUALITY_PRESETS[qualitySel.value]
       ? qualitySel.value
       : "Descktop";
-
-  let QUALITY_POINT_SHADOW = QUALITY_PRESETS[currentQuality].pointShadow;
   let QUALITY_SPOT_SHADOW = QUALITY_PRESETS[currentQuality].spotShadow;
   let QUALITY_ATMO_SCALE = QUALITY_PRESETS[currentQuality].atmoScale;
   let QUALITY_CLOUD_SCALE = QUALITY_PRESETS[currentQuality].cloudScale;
+  let QUALITY_GODRAY_ENABLED = QUALITY_PRESETS[currentQuality].godRays !== false;
   let QUALITY_GODRAY_SAMPLES = QUALITY_PRESETS[currentQuality].godRaySamples;
+  let QUALITY_GODRAY_SCALE = QUALITY_PRESETS[currentQuality].godRayScale ?? 0.5;
+  let QUALITY_GODRAY_INTENSITY = QUALITY_PRESETS[currentQuality].godRayIntensity ?? 0.08;
+  let QUALITY_GODRAY_DENSITY = QUALITY_PRESETS[currentQuality].godRayDensity ?? 0.7;
+  let QUALITY_GODRAY_DECAY = QUALITY_PRESETS[currentQuality].godRayDecay ?? 0.92;
+  let QUALITY_GODRAY_WEIGHT = QUALITY_PRESETS[currentQuality].godRayWeight ?? 0.18;
   let QUALITY_ATMO_STEPS = QUALITY_PRESETS[currentQuality].atmoSteps;
   let QUALITY_CLOUD_STEPS = QUALITY_PRESETS[currentQuality].cloudSteps;
   let QUALITY_CLOUD_LIGHT_STEPS =
     QUALITY_PRESETS[currentQuality].cloudLightSteps;
+  let QUALITY_RING_DUST_STEPS =
+    QUALITY_PRESETS[currentQuality].ringDustSteps;
   // Dynamic resolution + step scaling (FPS-driven)
   let dynScale = 1.0;
   let dynAtmoSteps = QUALITY_ATMO_STEPS;
   let dynCloudSteps = QUALITY_CLOUD_STEPS;
   let dynCloudLightSteps = QUALITY_CLOUD_LIGHT_STEPS;
   let dynGodraySamples = QUALITY_GODRAY_SAMPLES;
+  let dynRingDustSteps = QUALITY_RING_DUST_STEPS;
 
-  // Manual shadow update (see render loop)
-  let SHADOW_INTERVAL = 1.0 / 30.0;
-  let _shadowAccum = 0.0;
+  // Expensive fullscreen volumetrics render offscreen and are upsampled.
+  const RING_DUST_SCALE = 0.5;
+
   let _splMaskAccum = 0.0;
   let SPL_MASK_INTERVAL = 1.0 / 30.0; // throttle uniform updates
 
@@ -226,8 +242,9 @@ export function createWorld({ seed, preset } = {}) {
     new THREE.MeshStandardMaterial({
       color: 0xffcc66,
       emissive: 0xffaa33,
-      emissiveIntensity: 2.6,
-      roughness: 0.65,
+      emissiveIntensity: 10.0,
+      roughness: 0.58,
+      fog: false,
     }),
   );
   system.add(sun);
@@ -241,20 +258,22 @@ export function createWorld({ seed, preset } = {}) {
       depthWrite: false,
       depthTest: true,
       blending: THREE.AdditiveBlending,
-      opacity: 1.0,
-      color: 0xffcc88,
+      opacity: 1.8,
+      color: 0xffe8b5,
+      fog: false,
     }),
   );
   sunGlow.renderOrder = -10;
-  sunGlow.scale.setScalar(SUN_RADIUS * 10.0);
+  sunGlow.scale.setScalar(SUN_RADIUS * 13.0);
   sun.add(sunGlow);
 
   const corona = new THREE.Mesh(
-    new THREE.SphereGeometry(SUN_RADIUS * 1.12, 48, 24),
+    new THREE.SphereGeometry(SUN_RADIUS * 1.24, 48, 24),
     new THREE.MeshBasicMaterial({
-      color: 0xffbb66,
+      color: 0xffd38a,
       transparent: true,
-      opacity: 0.18,
+      opacity: 0.38,
+      fog: false,
       side: THREE.BackSide,
       depthWrite: false,
       blending: THREE.AdditiveBlending,
@@ -264,44 +283,101 @@ export function createWorld({ seed, preset } = {}) {
   sun.add(corona);
 
   ////////////////////////////////////////////////////////////////////////////////
-  // SUN LIGHT: SuperPointLight (PointLight + focused SpotLight shadows)
-  // - PointLight: omnidirectional light + coarse point shadows
-  // - Internal SpotLight: high-res shadows aimed at the player
-  //   Spot cone auto-adjusts so its radius at the player is ~300 units (cap 89°).
+  // SUN LIGHT: SuperPointLight (unshadowed PointLight + focused SpotLight shadows)
+  // - PointLight: omnidirectional direct sunlight; cube shadows are disabled
+  // - Internal SpotLight: high-res local shadows aimed at the camera
+  //   Spot cone + depth window form a local ~300 m shadow bubble.
   ////////////////////////////////////////////////////////////////////////////////
 
-  // TODO: Clean this
-  const SUN_LIGHT_INTENSITY = 18.0; // old "sun cube" total knob
+  // Direct solar irradiance used by lit world materials. This is deliberately
+  // expressed as the actual PointLight/SpotLight intensity rather than the old
+  // six-face cube-light total, so future tuning is predictable. The focused
+  // spotlight replaces (rather than adds to) the point-light contribution in
+  // its cone through the SuperPointLight material mask.
+  const SUN_SURFACE_LIGHT_INTENSITY = 14.0;
 
   const sunLight = new SuperPointLight(
     0xffffff,
-    SUN_LIGHT_INTENSITY / 6.0, // match old per-face energy feel
+    SUN_SURFACE_LIGHT_INTENSITY,
     260000,
     0.0,
     {
-      // point shadows (coarse)
-      pointCastShadow: true,
-      pointShadowMapSize: QUALITY_POINT_SHADOW,
-      pointShadowNear: 50,
-      pointShadowFar: 45000,
-      pointShadowBias: -0.0000005,
-      pointShadowNormalBias: 0.000001,
-
       // spot shadows (sharp)
       spotCastShadow: true,
       spotShadowMapSize: QUALITY_SPOT_SHADOW,
-      spotShadowNear: 50,
-      spotShadowFar: 45000,
-      spotShadowBias: -0.0000005,
-      spotShadowNormalBias: 0.000001,
+      // These are replaced every frame with a tight camera-centered depth
+      // window. Keep reasonable fallback values for the first frame.
+      spotShadowNear: 0.1,
+      spotShadowFar: 600.0,
+      spotShadowBias: -0.00001,
+      spotShadowNormalBias: 0.01,
       spotFocus: 1.0,
       spotAngleDeg: 45, // overridden dynamically
       spotPenumbra: 0.15,
       spotIntensityFactor: 1.0,
       spotDirection: new THREE.Vector3(0, 0, 1),
+
+      // Astronomical eclipse masking is analytic in the material shader, so it
+      // remains valid even though the high-detail spot shadow camera only spans
+      // the local d +/- 300 m depth window.
+      eclipseSunRadius: SUN_RADIUS,
+      eclipseSoftness: 0.015,
+      eclipseStrength: 1.0,
+      eclipseAmbientFloor: 0.12,
     },
   );
   system.add(sunLight);
+
+  function getShadowBiasParams() {
+    return {
+      spotBias: sunLight.shadowLight?.shadow?.bias ?? 0.0,
+      spotNormalBias: sunLight.shadowLight?.shadow?.normalBias ?? 0.0,
+    };
+  }
+
+  function setShadowBiasParams(params = {}) {
+    const spotShadow = sunLight.shadowLight?.shadow;
+    if (Number.isFinite(params.spotBias) && spotShadow) {
+      spotShadow.bias = params.spotBias;
+    }
+    if (Number.isFinite(params.spotNormalBias) && spotShadow) {
+      spotShadow.normalBias = params.spotNormalBias;
+    }
+  }
+
+  function applySpotShadowState({ disposeMaps = true, rebuildMaps = false } = {}) {
+    // PointLight cube shadows are permanently disabled. Only the focused
+    // SpotLight owns rasterized solar shadows.
+    sunLight.castShadow = false;
+    if (disposeMaps && sunLight.shadow?.map) {
+      sunLight.shadow.map.dispose();
+      sunLight.shadow.map = null;
+    }
+
+    const wantSpot = (QUALITY_SPOT_SHADOW | 0) > 0;
+    if (sunLight.shadowLight) {
+      sunLight.shadowLight.castShadow = wantSpot;
+      if (sunLight.shadowLight.shadow) {
+        if (wantSpot) {
+          sunLight.shadowLight.shadow.mapSize.set(
+            QUALITY_SPOT_SHADOW,
+            QUALITY_SPOT_SHADOW,
+          );
+          if (rebuildMaps && sunLight.shadowLight.shadow.map) {
+            sunLight.shadowLight.shadow.map.dispose();
+            sunLight.shadowLight.shadow.map = null;
+          }
+        } else if (disposeMaps && sunLight.shadowLight.shadow.map) {
+          sunLight.shadowLight.shadow.map.dispose();
+          sunLight.shadowLight.shadow.map = null;
+        }
+      }
+    }
+
+    renderer.shadowMap.needsUpdate = true;
+  }
+
+  applySpotShadowState({ disposeMaps: true });
 
   // Toggle with P
   const sunLightToggle = { on: true, saved: sunLight.intensity };
@@ -319,14 +395,17 @@ export function createWorld({ seed, preset } = {}) {
     }
   });
 
+  const SPL_SHADOW_BUBBLE_RADIUS = 300.0;
   let _splAngle = null;
-  function updateSunSuperPointLight(sunPosW, playerPosW, dt, tmp) {
+  function updateSunSuperPointLight(sunPosW, cameraPosW, dt, tmp) {
     sunLight.position.copy(sunPosW);
 
     const spot = sunLight.shadowLight;
 
-    // Aim spot at player (target is parented to sunLight => local-space target position)
-    tmp.vA.copy(playerPosW);
+    // Aim the focused shadow cone at the camera. The shadow map only needs to
+    // cover the local gameplay bubble, not tens of kilometres between the sun
+    // and the player.
+    tmp.vA.copy(cameraPosW);
     sunLight.worldToLocal(tmp.vA);
     spot.target.position.copy(tmp.vA);
 
@@ -336,8 +415,8 @@ export function createWorld({ seed, preset } = {}) {
     spot.target.updateMatrixWorld(true);
 
     // Auto half-angle: radius = tan(angle) * distance => angle = atan(radius / distance)
-    const d = Math.max(0.001, sunPosW.distanceTo(playerPosW));
-    const desiredRadius = 300.0;
+    const d = Math.max(0.001, sunPosW.distanceTo(cameraPosW));
+    const desiredRadius = SPL_SHADOW_BUBBLE_RADIUS;
     const maxA = THREE.MathUtils.degToRad(89.0);
     const minA = THREE.MathUtils.degToRad(0.05);
     const targetA = THREE.MathUtils.clamp(
@@ -351,18 +430,32 @@ export function createWorld({ seed, preset } = {}) {
     const alpha = 1.0 - Math.exp(-12.0 * Math.max(0.0, dt));
     _splAngle += (targetA - _splAngle) * alpha;
 
+    // Tight depth window centered on the camera. Perspective shadow precision
+    // depends heavily on near/far ratio; d +/- 300 m gives the focused map a
+    // local ~600 m deep bubble instead of wasting precision on 50..45000 m.
+    const shadowNear = Math.max(0.1, d - SPL_SHADOW_BUBBLE_RADIUS);
+    const shadowFar = Math.max(shadowNear + 1.0, d + SPL_SHADOW_BUBBLE_RADIUS);
+    const shadowCam = spot.shadow.camera;
+
+    let spotProjectionDirty = false;
     if (Math.abs(spot.angle - _splAngle) > 1e-5) {
       spot.angle = _splAngle;
-      spot.shadow.camera.near = 50.0;
-      spot.shadow.camera.far = 45000.0;
-      spot.shadow.camera.updateProjectionMatrix();
+      spotProjectionDirty = true;
     }
+    if (
+      Math.abs(shadowCam.near - shadowNear) > 0.05 ||
+      Math.abs(shadowCam.far - shadowFar) > 0.05
+    ) {
+      shadowCam.near = shadowNear;
+      shadowCam.far = shadowFar;
+      spotProjectionDirty = true;
+    }
+    if (spotProjectionDirty) shadowCam.updateProjectionMatrix();
 
-    if (sunLight.castShadow) {
-      sunLight.shadow.camera.near = 50.0;
-      sunLight.shadow.camera.far = 45000.0;
-      sunLight.shadow.camera.updateProjectionMatrix();
-    }
+    // Keep one analytic world-space occluder set for the PointLight/SpotLight
+    // handoff. Unlike either shadow map, this list is not clipped by the focused
+    // shadowCam.near/shadowCam.far window.
+    updateSuperPointEclipseOccluders(sunPosW, cameraPosW, tmp);
   }
 
   ////////////////////////////////////////////////////////////////////////////////
@@ -399,21 +492,80 @@ export function createWorld({ seed, preset } = {}) {
     });
 
     rtt.texture.colorSpace = THREE.LinearSRGBColorSpace;
+    rtt.texture.minFilter = THREE.LinearFilter;
+    rtt.texture.magFilter = THREE.LinearFilter;
     rtt.texture.generateMipmaps = false;
 
     return rtt;
   }
 
+  // The underwater pass samples the fully composed, tone-mapped frame. An
+  // RGBA8 target is sufficient here and avoids another full-resolution
+  // half-float allocation while the player is submerged.
+  function makeUnderwaterRT(w, h) {
+    const rtt = new THREE.WebGLRenderTarget(w, h, {
+      depthBuffer: false,
+      stencilBuffer: false,
+      type: THREE.UnsignedByteType,
+      format: THREE.RGBAFormat,
+    });
+
+    rtt.texture.colorSpace = THREE.LinearSRGBColorSpace;
+    rtt.texture.minFilter = THREE.LinearFilter;
+    rtt.texture.magFilter = THREE.LinearFilter;
+    rtt.texture.generateMipmaps = false;
+
+    return rtt;
+  }
+
+  function makeMaskRT(w, h) {
+    const useR8 =
+      renderer.capabilities.isWebGL2 &&
+      typeof THREE.RedFormat !== "undefined";
+    const rtt = new THREE.WebGLRenderTarget(w, h, {
+      depthBuffer: false,
+      stencilBuffer: false,
+      type: THREE.UnsignedByteType,
+      format: useR8 ? THREE.RedFormat : THREE.RGBAFormat,
+    });
+
+    // Cloud masks are scalar linear data. R8 avoids the bandwidth and storage
+    // cost of the old RGBA16F target; WebGL1 keeps a safe RGBA8 fallback.
+    if (useR8) rtt.texture.internalFormat = "R8";
+    rtt.texture.colorSpace = THREE.NoColorSpace;
+    rtt.texture.minFilter = THREE.LinearFilter;
+    rtt.texture.magFilter = THREE.LinearFilter;
+    rtt.texture.generateMipmaps = false;
+
+    return rtt;
+  }
+
+  const _drawingBufferSize = new THREE.Vector2();
+  renderer.getDrawingBufferSize(_drawingBufferSize);
+
   let rt = makeRT(innerWidth, innerHeight);
   let atmoRT = makeColorRT(
-    Math.floor(innerWidth * QUALITY_ATMO_SCALE),
-    Math.floor(innerHeight * QUALITY_ATMO_SCALE),
+    Math.max(1, Math.floor(innerWidth * QUALITY_ATMO_SCALE)),
+    Math.max(1, Math.floor(innerHeight * QUALITY_ATMO_SCALE)),
   );
-  let cloudRT = makeColorRT(
-    Math.floor(innerWidth * QUALITY_CLOUD_SCALE),
-    Math.floor(innerHeight * QUALITY_CLOUD_SCALE),
+  let cloudRT = makeMaskRT(
+    Math.max(1, Math.floor(innerWidth * QUALITY_CLOUD_SCALE)),
+    Math.max(1, Math.floor(innerHeight * QUALITY_CLOUD_SCALE)),
   );
-  cloudRT.texture.colorSpace = THREE.NoColorSpace;
+
+  let ringDustRT = makeColorRT(
+    Math.max(1, Math.floor(atmoRT.width * RING_DUST_SCALE)),
+    Math.max(1, Math.floor(atmoRT.height * RING_DUST_SCALE)),
+  );
+  ringDustRT.texture.colorSpace = THREE.NoColorSpace;
+
+  let godRayRT = makeColorRT(
+    Math.max(1, Math.floor(_drawingBufferSize.x * QUALITY_GODRAY_SCALE)),
+    Math.max(1, Math.floor(_drawingBufferSize.y * QUALITY_GODRAY_SCALE)),
+  );
+  godRayRT.texture.colorSpace = THREE.NoColorSpace;
+
+  let underwaterRT = makeUnderwaterRT(rt.width, rt.height);
 
   // rt -> screen copy
   const { scene: copyScene, material: copyMat } = createCopyPass(
@@ -429,6 +581,26 @@ export function createWorld({ seed, preset } = {}) {
     fsTri,
     atmoRT.texture,
     0.25,
+  );
+
+  // Low-resolution volumetric passes are composited once after upsampling.
+  const {
+    scene: ringDustCompositeScene,
+    material: ringDustCompositeMat,
+  } = createTextureCompositePass(
+    THREE,
+    fsTri,
+    ringDustRT.texture,
+    THREE.NormalBlending,
+  );
+  const {
+    scene: godRayCompositeScene,
+    material: godRayCompositeMat,
+  } = createTextureCompositePass(
+    THREE,
+    fsTri,
+    godRayRT.texture,
+    THREE.AdditiveBlending,
   );
 
   ////////////////////////////////////////////////////////////////////////////////
@@ -617,13 +789,78 @@ void main() {
     },
   );
 
+  // One shared deterministic 3D-noise atlas for all volumetric materials.
+  // This keeps the texture-backed cloud/ring/gas-giant shaders cheap without
+  // allocating a separate atlas per body.
+  const { texture: volumeNoiseTex, layout: volumeNoiseLayout } =
+    createVolumeNoiseAtlas(THREE, (initialSeed ^ 0x71c3a9d5) >>> 0);
+  const volumeNoiseUniforms = () =>
+    makeVolumeNoiseUniforms(THREE, volumeNoiseTex, volumeNoiseLayout);
+  world.volumeNoiseTex = volumeNoiseTex;
+  world.volumeNoiseLayout = volumeNoiseLayout;
+
+  // Clouds use their own channel-packed Perlin-Worley volume. WebGL2 gets a
+  // native sampler3D path (one hardware-trilinear lookup); WebGL1 retains the
+  // proven bordered 2D atlas path (two filtered lookups). `?cloudNoise=atlas`
+  // is an explicit troubleshooting fallback without changing saved settings.
+  let forceCloudAtlas = false;
+  try {
+    forceCloudAtlas =
+      new URLSearchParams(window.location.search).get("cloudNoise") === "atlas";
+  } catch {}
+
+  let cloud3DCapable = false;
+  if (
+    !forceCloudAtlas &&
+    renderer.capabilities.isWebGL2 &&
+    typeof THREE.Data3DTexture === "function"
+  ) {
+    try {
+      const gl = renderer.getContext();
+      const max3D = gl.getParameter(gl.MAX_3D_TEXTURE_SIZE) || 0;
+      cloud3DCapable = max3D >= VOLUME_NOISE_SIZE;
+    } catch {
+      cloud3DCapable = false;
+    }
+  }
+
+  const {
+    texture: cloudNoiseTex,
+    texture3D: generatedCloudNoiseTex3D,
+    layout: cloudNoiseLayout,
+  } = createCloudNoiseAtlas(THREE, (initialSeed ^ 0x4f1bbcdc) >>> 0, {
+    create3D: cloud3DCapable,
+  });
+  const cloudNoiseTex3D = generatedCloudNoiseTex3D || null;
+  const useCloudNoise3D = cloud3DCapable && !!cloudNoiseTex3D;
+  const cloudNoiseUniforms = () =>
+    makeCloudNoiseUniforms(
+      THREE,
+      cloudNoiseTex,
+      cloudNoiseLayout,
+      cloudNoiseTex3D,
+    );
+  const cloudShaderDefines = useCloudNoise3D
+    ? Object.freeze({ USE_CLOUD_NOISE_3D: 1 })
+    : null;
+  world.cloudNoiseTex = cloudNoiseTex;
+  world.cloudNoiseTex3D = cloudNoiseTex3D;
+  world.cloudNoiseLayout = cloudNoiseLayout;
+  world.cloudNoiseMode = useCloudNoise3D ? "3d" : "atlas";
+
   ////////////////////////////////////////////////////////////////////////////////
   // Underwater post overlays
   const {
     scene: postScene,
     tintMat,
     particlesMat,
-  } = createUnderwaterPost(THREE, fsTri, blueNoiseTex);
+  } = createUnderwaterPost(
+    THREE,
+    fsTri,
+    blueNoiseTex,
+    underwaterRT.texture,
+    rt.depthTexture,
+  );
 
   ////////////////////////////////////////////////////////////////////////////////
   // God Rays pass (cloud-occluded)
@@ -665,6 +902,38 @@ void main() {
       .getHex();
   }
 
+  function makeOceanColor(seed) {
+    const r = mulberry32(seed ^ 0x51f15e);
+    // Keep ocean absorption in a believable blue/teal family. Per-planet
+    // variation comes from hue, saturation, atmosphere reflection and murk,
+    // rather than arbitrary red/yellow base colors.
+    const hue = 0.50 + r() * 0.085;
+    const saturation = 0.56 + r() * 0.22;
+    const lightness = 0.18 + r() * 0.1;
+    return new THREE.Color()
+      .setHSL(hue, saturation, lightness)
+      .getHex();
+  }
+
+  function makeOceanParams(seed) {
+    const r = mulberry32(seed ^ 0x0ceaa11);
+    return {
+      oceanMurk: 0.46 + r() * 0.18,
+      waveAmp: 1.8 + r() * 1.0,
+      // The MdXyzX wave family starts with an internal phase multiplier of 6,
+      // so these values produce a broad swell near 75-100 world units with
+      // progressively smaller dragged octaves layered over it.
+      waveFreq: 0.0105 + r() * 0.0035,
+      waveSpeed: 0.42 + r() * 0.26,
+      waveChoppiness: 0.90 + r() * 0.25,
+      oceanWaveDrag: 0.044 + r() * 0.008,
+      oceanWaveIterations: 14.0,
+      oceanRoughness: 0.065 + r() * 0.040,
+      oceanShallowOpacity: 0.52 + r() * 0.10,
+      oceanDeepOpacity: 0.87 + r() * 0.06,
+    };
+  }
+
   ////////////////////////////////////////////////////////////////////////////////
   // Planet size archetypes (real-world-inspired) to increase size variety.
   // - Rocky planets pick from: Mercury, Earth, Kepler-22b
@@ -683,11 +952,19 @@ void main() {
   }
 
   function addPlanet(cfg) {
-    const p = new QuadSphereBody(cfg);
+    const p = new QuadSphereBody({
+      ...cfg,
+      terrainPatchBudget:
+        cfg.terrainPatchBudget ?? getPreset(currentQuality).terrainPatchBudget,
+      cloudNoiseTexture: cloudNoiseTex,
+      cloudNoiseLayout,
+    });
     // Terrain patches can stream in after the system finalizes; patch the shared material now
     // so it always uses the SuperPointLight mask (prevents double lighting from point+spot).
     try {
-      registerSPLMaterial(p.terrainMat, sunLight);
+      for (const material of p.terrainMaterials ?? [p.terrainMat]) {
+        registerSPLMaterial(material, sunLight);
+      }
     } catch (e) {
       // ignore
     }
@@ -698,7 +975,11 @@ void main() {
   }
 
   function addGasGiant(cfg) {
-    const p = new GasGiantBody(cfg);
+    const p = new GasGiantBody({
+      ...cfg,
+      volumeNoiseTexture: volumeNoiseTex,
+      volumeNoiseLayout,
+    });
     system.add(p.group);
     p.index = bodies.length;
     bodies.push(p);
@@ -790,17 +1071,18 @@ void main() {
   function asteroidCountForQuality(q) {
     switch (q) {
       case "Potato":
-        // Still visible, but keeps draw calls and instance counts low.
-        return 8000;
+        return 2000;
       case "Laptop":
-        return 20000;
+        return 6000;
       case "Descktop":
       case "Desktop":
-        return 45000;
-      case "Ultra":
-        return 70000;
+        return 15000;
+      case "GamingPC":
+        return 18000;
+      case "NASA":
+        return 24000;
       default:
-        return 32000;
+        return 15000;
     }
   }
 
@@ -809,16 +1091,34 @@ void main() {
     // Keep these numbers modest; rings can exist on multiple planets.
     switch (q) {
       case "Potato":
-        return 800;
+        return 300;
       case "Laptop":
-        return 1800;
+        return 700;
       case "Descktop":
       case "Desktop":
-        return 3800;
-      case "Ultra":
-        return 6200;
+        return 1400;
+      case "GamingPC":
+        return 1800;
+      case "NASA":
+        return 2400;
       default:
-        return 2600;
+        return 1400;
+    }
+  }
+
+  function asteroidRockDetailForQuality(q) {
+    switch (q) {
+      case "Potato":
+        return 0;
+      case "Laptop":
+      case "Descktop":
+      case "Desktop":
+        return 1;
+      case "GamingPC":
+      case "NASA":
+        return 2;
+      default:
+        return 1;
     }
   }
 
@@ -876,9 +1176,8 @@ void main() {
     if (!spec) return null;
 
     const total = ringAsteroidCountForQuality(currentQuality);
-    const segments = Math.max(8, Math.min(18, Math.round(total / 260)));
-    const rockDetail =
-      currentQuality === "Potato" ? 1 : currentQuality === "Laptop" ? 2 : 3;
+    const segments = Math.max(6, Math.min(16, Math.round(total / 180)));
+    const rockDetail = asteroidRockDetailForQuality(currentQuality);
 
     const ring = createPlanetRing({
       superPointLight: sunLight,
@@ -975,10 +1274,9 @@ void main() {
     }
 
     const total = asteroidCountForQuality(currentQuality);
-    const segments = Math.max(12, Math.min(36, Math.round(total / 220)));
+    const segments = Math.max(12, Math.min(32, Math.round(total / 500)));
 
-    const rockDetail =
-      currentQuality === "Potato" ? 1 : currentQuality === "Laptop" ? 2 : 3;
+    const rockDetail = asteroidRockDetailForQuality(currentQuality);
 
     asteroidBelt = createAsteroidBelt({
       superPointLight: sunLight,
@@ -1084,12 +1382,20 @@ void main() {
       rockSpan: 1e9,
     };
 
-    const moon = new QuadSphereBody(moonCfg);
+    const moon = new QuadSphereBody({
+      ...moonCfg,
+      terrainPatchBudget:
+        cfg.terrainPatchBudget ?? getPreset(currentQuality).terrainPatchBudget,
+      cloudNoiseTexture: cloudNoiseTex,
+      cloudNoiseLayout,
+    });
 
     // Same as planets: ensure the shared terrain material is SPL-masked even if patches
     // stream in after finalization.
     try {
-      registerSPLMaterial(moon.terrainMat, sunLight);
+      for (const material of moon.terrainMaterials ?? [moon.terrainMat]) {
+        registerSPLMaterial(material, sunLight);
+      }
     } catch (e) {
       // ignore
     }
@@ -1185,9 +1491,10 @@ void main() {
       const heightAmp = (120 + ((seed >> 9) % 150)) * NMS_RADIUS_SCALE;
       const heightFreq = 1.6 + (((seed >> 5) % 100) / 100) * 1.2;
       const color = makeColor(seed);
-      const oceanColor = makeColor(seed ^ 0xabcdef);
+      const oceanColor = makeOceanColor(seed ^ 0xabcdef);
+      const oceanParams = makeOceanParams(seed);
       const atmoTint = seededHsl(seed ^ 0x13579b, 0.7, 0.55);
-      const cloudTint = seededHsl(seed ^ 0x2468ac, 0.25, 0.92);
+      const cloudTint = seededHsl(seed ^ 0x2468ac, 0.08, 0.97);
 
       out.push({
         name: `PLANET-${String(i + 1).padStart(2, "0")}`,
@@ -1197,10 +1504,7 @@ void main() {
         heightFreq,
         color,
         oceanColor,
-        oceanMurk: 0.62,
-        waveAmp: 2.8,
-        waveFreq: 0.013,
-        waveSpeed: 0.62,
+        ...oceanParams,
         seaLevelOffset: 0,
         seabedDepth: heightAmp * 0.2,
         shoreWidth: 24 * NMS_RADIUS_SCALE,
@@ -1370,7 +1674,7 @@ void main() {
           sun.material.color.setHex(tint);
           sun.material.emissive.setHex(tint);
           sun.material.emissiveIntensity =
-            2.2 + ((currentSystemSeed & 255) / 255) * 1.2;
+            8.0 + ((currentSystemSeed & 255) / 255) * 4.0;
           tr.didSun = true;
           ops++;
           continue;
@@ -1395,14 +1699,12 @@ void main() {
           asteroidBeltSpec = spec;
 
           const total = asteroidCountForQuality(currentQuality);
-          const segments = Math.max(12, Math.min(36, Math.round(total / 220)));
+          const segments = Math.max(
+            12,
+            Math.min(32, Math.round(total / 500)),
+          );
 
-          const rockDetail =
-            currentQuality === "Potato"
-              ? 1
-              : currentQuality === "Laptop"
-                ? 2
-                : 3;
+          const rockDetail = asteroidRockDetailForQuality(currentQuality);
 
           tr.belt = createAsteroidBelt({
             superPointLight: sunLight,
@@ -1589,7 +1891,7 @@ void main() {
       sun.material.color.setHex(tint);
       sun.material.emissive.setHex(tint);
       sun.material.emissiveIntensity =
-        2.2 + ((currentSystemSeed & 255) / 255) * 1.2;
+        8.0 + ((currentSystemSeed & 255) / 255) * 4.0;
     }
 
     // Planets
@@ -1636,10 +1938,11 @@ void main() {
         const heightAmp = (120 + ((seed >> 9) % 150)) * NMS_RADIUS_SCALE;
         const heightFreq = 1.6 + (((seed >> 5) % 100) / 100) * 1.2;
         const color = makeColor(seed);
-        const oceanColor = makeColor(seed ^ 0xabcdef);
+        const oceanColor = makeOceanColor(seed ^ 0xabcdef);
+        const oceanParams = makeOceanParams(seed);
 
         const atmoTint = seededHsl(seed ^ 0x13579b, 0.7, 0.55);
-        const cloudTint = seededHsl(seed ^ 0x2468ac, 0.25, 0.92);
+        const cloudTint = seededHsl(seed ^ 0x2468ac, 0.08, 0.97);
 
         addPlanet({
           name: `PLANET-${String(i + 1).padStart(2, "0")}`,
@@ -1649,10 +1952,7 @@ void main() {
           heightFreq,
           color,
           oceanColor,
-          oceanMurk: 0.62,
-          waveAmp: 2.8,
-          waveFreq: 0.013,
-          waveSpeed: 0.62,
+          ...oceanParams,
           seaLevelOffset: 0,
           seabedDepth: heightAmp * 0.2,
           shoreWidth: 24 * NMS_RADIUS_SCALE,
@@ -1788,11 +2088,119 @@ void main() {
 
   // Shared eclipse helpers (CPU side) for things that aren’t in the atmo shader
   // (e.g. underwater fog / post tint). Mirrors the GLSL in atmoFS.
+  // Maximum absolute displacement of the 5-octave terrain FBM used by
+  // QuadSphereBody (amp starts at 0.5 and uses gain 0.52). Keep this in sync
+  // with TERRAIN_FBM_ABS_MAX in terrain/quadsphere.js.
+  const ECLIPSE_TERRAIN_FBM_ABS_MAX =
+    (0.5 * (1.0 - Math.pow(0.52, 5))) / (1.0 - 0.52);
+
   function bodyRadiusForEclipse(b) {
     const sl = b?.seaLevel;
-    if (typeof sl === "number" && sl > 0) return sl;
     const br = b?.cfg?.baseRadius ?? b?.baseRadius;
-    return typeof br === "number" && isFinite(br) && br > 0 ? br : 1400;
+    const baseRadius =
+      typeof br === "number" && isFinite(br) && br > 0 ? br : 1400;
+
+    // Airless moons use a negative sea-level sentinel, so using baseRadius alone
+    // made their analytic SPL silhouette smaller than the actual displaced
+    // terrain mesh. Expand moon occluders to the guaranteed outer terrain
+    // envelope so the hard eclipse core agrees with the coarse shadow caster.
+    if (moons.includes(b)) {
+      const ha = Math.abs(Number(b?.heightAmp ?? b?.cfg?.heightAmp ?? 0.0));
+      return baseRadius + ha * ECLIPSE_TERRAIN_FBM_ABS_MAX;
+    }
+
+    if (typeof sl === "number" && sl > 0) return sl;
+    return baseRadius;
+  }
+
+  // Reused candidate records avoid allocating one object per body every frame.
+  // The sort is relative to the centre of the focused shadow bubble, so if a
+  // generated system ever exceeds the shader cap, bodies capable of eclipsing
+  // this local region win over irrelevant distant bodies.
+  const splEclipseCandidates = [];
+  function updateSuperPointEclipseOccluders(sunPosW, focusPosW, tmp) {
+    const eclipse = sunLight.eclipse;
+    if (!eclipse) return;
+
+    eclipse.sunPosW.copy(sunPosW);
+    eclipse.sunRadius = SUN_RADIUS;
+
+    const toSun = tmp.vB.copy(sunPosW).sub(focusPosW);
+    const sunDistance = toSun.length();
+    if (sunDistance <= 1e-6) {
+      eclipse.count = 0;
+      eclipse.radii.fill(0);
+      return;
+    }
+    toSun.multiplyScalar(1.0 / sunDistance);
+
+    let candidateCount = 0;
+    for (let i = 0; i < bodies.length; i++) {
+      const body = bodies[i];
+      if (!body?.group) continue;
+
+      const center = body.group.getWorldPosition(tmp.vA.set(0, 0, 0));
+      const radius = bodyRadiusForEclipse(body);
+
+      const dx = center.x - focusPosW.x;
+      const dy = center.y - focusPosW.y;
+      const dz = center.z - focusPosW.z;
+      const along = dx * toSun.x + dy * toSun.y + dz * toSun.z;
+      const distSq = dx * dx + dy * dy + dz * dz;
+      const perp = Math.sqrt(Math.max(0.0, distSq - along * along));
+      const potentiallyBetween =
+        along > -SPL_SHADOW_BUBBLE_RADIUS &&
+        along < sunDistance + SPL_SHADOW_BUBBLE_RADIUS;
+
+      // Include the finite solar disc and the whole local shadow bubble when
+      // ranking relevance. Expand the along-range by the bubble depth as well:
+      // an occluder just behind the camera can still lie between the sun and a
+      // fragment at the back edge of the focused 600 m depth slab.
+      const projectedAlong = THREE.MathUtils.clamp(along, 0.0, sunDistance);
+      const projectedSunRadius = SUN_RADIUS * (projectedAlong / sunDistance);
+      const influenceRadius =
+        radius + projectedSunRadius + SPL_SHADOW_BUBBLE_RADIUS;
+      const miss = Math.max(0.0, perp - influenceRadius);
+
+      // This occluder set now feeds both sides of the PointLight/SpotLight
+      // handoff, not just the 600 m spot shadow bubble. Do not hard-cull bodies
+      // merely because their penumbra misses that local bubble: a fragment just
+      // outside the focused cone still needs the same world-space eclipse answer.
+      // The shader cap is handled by relevance sorting instead.
+      const score =
+        (potentiallyBetween ? 0.0 : 1000.0) +
+        miss / Math.max(influenceRadius, 1e-5) +
+        perp / Math.max(influenceRadius, 1e-5) +
+        0.001 * (perp / Math.max(radius, 1e-5));
+
+      let candidate = splEclipseCandidates[candidateCount];
+      if (!candidate) {
+        candidate = { x: 0, y: 0, z: 0, r: 0, score: 0 };
+        splEclipseCandidates[candidateCount] = candidate;
+      }
+      candidate.x = center.x;
+      candidate.y = center.y;
+      candidate.z = center.z;
+      candidate.r = radius;
+      candidate.score = score;
+      candidateCount++;
+    }
+
+    splEclipseCandidates.length = candidateCount;
+    splEclipseCandidates.sort((a, b) => a.score - b.score);
+
+    const maxCount = eclipse.radii.length;
+    const n = Math.min(candidateCount, maxCount);
+    eclipse.count = n;
+    for (let i = 0; i < n; i++) {
+      const candidate = splEclipseCandidates[i];
+      const j = i * 3;
+      eclipse.centers[j] = candidate.x;
+      eclipse.centers[j + 1] = candidate.y;
+      eclipse.centers[j + 2] = candidate.z;
+      eclipse.radii[i] = candidate.r;
+    }
+    for (let i = n; i < maxCount; i++) eclipse.radii[i] = 0.0;
   }
 
   function raySphereHitCPU(ro, rd, c, r) {
@@ -1813,39 +2221,69 @@ void main() {
 
   function sunVisibilityCPU(pW, sunPosW, ignoreBody, tmp, softness, strength) {
     const toSun = tmp.vD.copy(sunPosW).sub(pW);
-    const maxT = toSun.length();
-    if (maxT <= 1e-6) return 1.0;
-    const rd = toSun.multiplyScalar(1.0 / maxT);
+    const sunDistance = toSun.length();
+    if (sunDistance <= 1e-6) return 1.0;
+    const sunDirection = toSun.multiplyScalar(1.0 / sunDistance);
 
-    let vis = 1.0;
+    let visibility = 1.0;
     for (let i = 0; i < bodies.length; i++) {
       const b = bodies[i];
       if (!b || b === ignoreBody) continue;
-      const c = b.group.getWorldPosition(tmp.vE.set(0, 0, 0));
-      const r = bodyRadiusForEclipse(b);
 
-      const tHit = raySphereHitCPU(pW, rd, c, r);
-      if (tHit < maxT) {
-        const ocx = pW.x - c.x;
-        const ocy = pW.y - c.y;
-        const ocz = pW.z - c.z;
-        const bproj = ocx * rd.x + ocy * rd.y + ocz * rd.z;
-        const d2 = Math.max(
-          0,
-          ocx * ocx + ocy * ocy + ocz * ocz - bproj * bproj,
-        );
-        const d = Math.sqrt(d2);
-        // Soft penumbra: smooth transition around the geometric edge.
-        // (Matches the shader-side behavior; avoids a hard cut.)
-        const w = r * softness;
-        const edge = THREE.MathUtils.smoothstep(d, r - w, r + w);
-        vis = Math.min(vis, edge);
+      const c = b.group.getWorldPosition(tmp.vE.set(0, 0, 0));
+      const occR = bodyRadiusForEclipse(b);
+      const toOccX = c.x - pW.x;
+      const toOccY = c.y - pW.y;
+      const toOccZ = c.z - pW.z;
+      const along =
+        toOccX * sunDirection.x +
+        toOccY * sunDirection.y +
+        toOccZ * sunDirection.z;
+      if (along <= 0.0 || along >= sunDistance) continue;
+
+      const dx = toOccX - sunDirection.x * along;
+      const dy = toOccY - sunDirection.y * along;
+      const dz = toOccZ - sunDirection.z * along;
+      const perp = Math.sqrt(dx * dx + dy * dy + dz * dz);
+
+      // Match the shared SPL shadow semantics: the centre ray is a hard
+      // point-source core, while the finite solar disc supplies the penumbra.
+      if (perp <= occR) {
+        visibility = 0.0;
+        break;
       }
+
+      const projectedSunRadius = Math.max(
+        SUN_RADIUS * (along / sunDistance),
+        occR * Math.max(softness, 0.0001),
+      );
+      const outer = occR + projectedSunRadius;
+      if (perp >= outer) continue;
+
+      const inner = Math.abs(occR - projectedSunRadius);
+      const overlap =
+        1.0 -
+        THREE.MathUtils.smoothstep(
+          perp,
+          inner,
+          Math.max(inner + 1e-4, outer),
+        );
+      const maxCoverage =
+        occR >= projectedSunRadius
+          ? 1.0
+          : THREE.MathUtils.clamp(
+              (occR * occR) /
+                Math.max(1e-5, projectedSunRadius * projectedSunRadius),
+              0.0,
+              1.0,
+            );
+
+      visibility = Math.min(visibility, 1.0 - overlap * maxCoverage);
     }
 
     return THREE.MathUtils.lerp(
       1.0,
-      vis,
+      visibility,
       THREE.MathUtils.clamp(strength, 0.0, 1.0),
     );
   }
@@ -1857,12 +2295,10 @@ void main() {
     const originW = pass?.mat?.uniforms?.uPlanetCenterW?.value;
     const sunPosW = pass?.mat?.uniforms?.uSunPosW?.value;
 
-    // Helper: choose a valid sphere radius (moons have seaLevel as a negative sentinel)
+    // Use the same eclipse sphere definition as the shared SPL path, including
+    // the conservative displaced-terrain envelope for airless moons.
     function bodyRadius(b) {
-      const sl = b?.seaLevel;
-      if (typeof sl === "number" && sl > 0) return sl;
-      const br = b?.cfg?.baseRadius ?? b?.baseRadius;
-      return typeof br === "number" && isFinite(br) && br > 0 ? br : 1400;
+      return bodyRadiusForEclipse(b);
     }
 
     // If we can't get origin/sun, just fill sequentially (still with correct radii).
@@ -1912,7 +2348,7 @@ void main() {
 
     if (rd) cand.sort((a, b) => a.score - b.score);
 
-    const n = Math.min(MAX_OCCLUDERS, cand.length);
+    const n = Math.min(outRadii?.length ?? MAX_OCCLUDERS, cand.length);
     for (let i = 0; i < n; i++) {
       const o = cand[i];
       outCenters[i * 3 + 0] = o.x;
@@ -1926,15 +2362,21 @@ void main() {
 
   function makeAtmoPassForBody(body) {
     const baseR = body.cfg.baseRadius;
-    // Atmosphere raymarch should stop at a conservative *minimum* surface radius.
-    // Ocean waves can displace the surface inward; if we clamp the raymarch to the
-    // undeformed radius, wave troughs can look like the atmosphere "cuts out".
-    const waveAmp = body?.cfg?.waveAmp ?? 0.0;
-    const groundR = body?.ocean
-      ? Math.max(1.0, (body.seaLevel ?? baseR) - waveAmp * 1.05)
+    // Ocean vertices now sway within a conservative radial envelope. Use the
+    // lowest possible trough as the atmospheric ground bound. Above water, scene
+    // depth terminates at the displaced surface; underwater, the transparent
+    // ocean stops writing depth and the shader starts at mean sea level instead.
+    const oceanDisplacement = body?.oceanSurfaceDisplacement ?? 0.0;
+    const groundR = body?.hasOcean
+      ? Math.max(1.0, (body.seaLevel ?? baseR) - oceanDisplacement)
       : baseR;
 
     const u = {
+      ...cloudNoiseUniforms(),
+      // Explicitly select the stable combined atmosphere+cloud path. The
+      // regression build split these into temporally blended screen-space
+      // histories; this pass renders the current camera view in one draw.
+      uRenderMode: { value: 0.0 },
       uInvViewMatrix: { value: new THREE.Matrix4() },
       uInvProjMatrix: { value: new THREE.Matrix4() },
       uDepthTex: { value: rt.depthTexture },
@@ -1943,8 +2385,25 @@ void main() {
       uPlanetCenterW: { value: new THREE.Vector3() },
       uPlanetRadius: { value: baseR },
       uGroundRadius: { value: groundR },
+      // Mean sea-level radius. A negative value marks an atmosphere with no
+      // ocean. When the camera is submerged, the atmosphere shader begins its
+      // integration just outside this surface instead of treating the water
+      // column as air.
+      uOceanRadius: {
+        value: body?.hasOcean ? (body.seaLevel ?? baseR) : -1.0,
+      },
       uAtmoHeight: { value: baseR * 0.33 },
       uSunPosW: { value: new THREE.Vector3() },
+      uSunRadius: { value: SUN_RADIUS },
+      // The opaque scene sun is intentionally veiled by dense daylight air.
+      // Reconstruct a bright, eclipse-aware disc and halo in the atmosphere
+      // pass so the star still punches through when viewed from the surface.
+      uSurfaceSunDiscIntensity: {
+        value: body.cfg.surfaceSunDiscIntensity ?? 18.0,
+      },
+      uSurfaceSunHaloIntensity: {
+        value: body.cfg.surfaceSunHaloIntensity ?? 3.2,
+      },
 
       uBlueNoiseTex: { value: blueNoiseTex },
       uBlueNoiseSize: { value: new THREE.Vector2(256, 256) },
@@ -1959,25 +2418,60 @@ void main() {
       uMinLight: { value: 0.005 },
       // Day side should read less transparent than the rim.
       uDayOpacityBoost: { value: 2.1 },
+      // Keep the host terrain readable while allowing sunlit air to strongly
+      // veil unrelated background bodies. At 0.94 only about 6% of a distant
+      // body remains before atmospheric colour and tone mapping are applied.
+      uDaySurfaceOpacity: {
+        value: body.cfg.atmoDaySurfaceOpacity ?? 0.84,
+      },
+      uDayBackgroundOpacity: {
+        value: body.cfg.atmoDayBackgroundOpacity ?? 0.94,
+      },
 
-      uCloudBase: { value: baseR * 0.05 },
-      uCloudThickness: { value: baseR * 0.04 },
+      uCloudBase: { value: baseR * 0.035 },
+      uCloudThickness: { value: baseR * 0.06 },
       uCloudSteps: { value: QUALITY_CLOUD_STEPS },
-      uCloudDensity: { value: 0.65 },
-      uCloudCoverage: { value: 0.54 },
-      uCloudSoftness: { value: 0.18 },
-      uCloudFreq: { value: 4.0 },
-      uCloudDetailFreq: { value: 15.0 },
+      // The reference demo uses 0.5 density. Optical scales below make that
+      // value portable across different planet and moon radii.
+      uCloudDensity: { value: 0.50 },
+      uCloudExtinctionScale: { value: 2.8 },
+      uCloudLightExtinctionScale: { value: 2.5 },
+      uCloudAmbientStrength: { value: 0.12 },
+      uCloudCoverage: { value: 0.61 },
+      uCloudSoftness: { value: 0.20 },
+      // Approximate the repo's ~2.5 broad and ~10 detail cycles across a mass.
+      uCloudFreq: { value: 9.0 },
+      uCloudDetailFreq: { value: 64.0 },
+      uCloudNoiseOffset: {
+        value: (() => {
+          const random = mulberry32(
+            ((body?.cfg?.seed ?? 1) ^ 0x9e3779b9) >>> 0,
+          );
+          return new THREE.Vector3(
+            random() * 13.0,
+            random() * 13.0,
+            random() * 13.0,
+          );
+        })(),
+      },
       uCloudWindSpeed: { value: 0.025 },
       uCloudLightSteps: { value: QUALITY_CLOUD_LIGHT_STEPS },
-      uCloudShadowStrength: { value: 0.55 },
-      uCloudPhase: { value: 0.55 },
+      uCloudShadowStrength: { value: 0.85 },
+      uCloudPhase: { value: 0.30 },
+      // Updated every frame from projected cloud size and the active quality
+      // step budget. Zero means base shape only; one enables full erosion detail.
+      uCloudDetailLod: { value: 1.0 },
+      uCloudMultiScatterStrength: { value: 0.20 },
+      uCloudPowderStrength: { value: 0.44 },
+      // One keeps conservative empty-space skipping enabled. Setting this to
+      // zero restores fixed-step marching for visual A/B diagnostics.
+      uCloudSkipStrength: { value: 1.0 },
 
       uUseCheapClouds: { value: 0.0 },
-      uCheapCloudAlpha: { value: 0.22 },
+      uCheapCloudAlpha: { value: 0.26 },
       uCheapCloudScale: { value: 1.0 },
-      uCheapCloudSharp: { value: 1.6 },
-      uCheapCloudRim: { value: 0.35 },
+      uCheapCloudSharp: { value: 1.35 },
+      uCheapCloudRim: { value: 0.52 },
       uCheapCloudFarBoost: { value: 0.0 },
       uCheapCloudContrast: { value: 1.0 },
 
@@ -2011,6 +2505,7 @@ void main() {
       depthTest: false,
       depthWrite: false,
       blending: THREE.NormalBlending,
+      defines: cloudShaderDefines ? { ...cloudShaderDefines } : undefined,
       uniforms: u,
       vertexShader: atmoVS,
       fragmentShader: atmoFS,
@@ -2025,6 +2520,7 @@ void main() {
       depthTest: false,
       depthWrite: false,
       blending: THREE.NoBlending,
+      defines: cloudShaderDefines ? { ...cloudShaderDefines } : undefined,
       uniforms: u,
       vertexShader: atmoVS,
       fragmentShader: cloudMaskFS,
@@ -2097,12 +2593,26 @@ void main() {
   const _ringInnerArr = new Float32Array(8);
   const _ringOuterArr = new Float32Array(8);
   const _ringHalfHArr = new Float32Array(8);
+  const _ringSplitEnabledArr = new Float32Array(8);
+  const _ringOwnerAtmoEnabledArr = new Float32Array(8);
+  const _ringOwnerAtmoRadiusArr = new Float32Array(8);
+  const _ringGlobalAtmoSplitArr = new Float32Array(8);
+  const _ringOwnerCenterArr = Array.from(
+    { length: 8 },
+    () => new THREE.Vector3(),
+  );
+  const _ringGlobalAtmoCenterArr = Array.from(
+    { length: 8 },
+    () => new THREE.Vector3(),
+  );
+  const _ringGlobalAtmoRadiusArr = new Float32Array(8);
   const _ringTintArr = Array.from(
     { length: 8 },
     () => new THREE.Vector3(1, 1, 1),
   );
 
   const ringDustUniforms = {
+    ...volumeNoiseUniforms(),
     uInvViewMatrix: { value: new THREE.Matrix4() },
     uInvProjMatrix: { value: new THREE.Matrix4() },
     uDepthTex: { value: rt.depthTexture },
@@ -2119,11 +2629,28 @@ void main() {
     uRingInner: { value: _ringInnerArr },
     uRingOuter: { value: _ringOuterArr },
     uRingHalfHeight: { value: _ringHalfHArr },
+    // Planet rings are split around their centre plane so rear sections can be
+    // composited below atmosphere and near sections above it. The system belt
+    // remains unsplit and uses the established front layer.
+    uRingSplitEnabled: { value: _ringSplitEnabledArr },
+    // Owner-atmosphere data lets the shader decide front/back using the actual
+    // view-ray entry into the atmosphere rather than a centre plane.
+    uRingOwnerAtmoEnabled: { value: _ringOwnerAtmoEnabledArr },
+    uRingOwnerAtmoRadius: { value: _ringOwnerAtmoRadiusArr },
+    uRingOwnerCenterW: { value: _ringOwnerCenterArr },
+    // System-scale asteroid dust has no single owner. It is split against the
+    // actual atmospheric spheres it can pass behind in screen space.
+    uRingGlobalAtmoSplit: { value: _ringGlobalAtmoSplitArr },
+    uGlobalAtmoCount: { value: 0 },
+    uGlobalAtmoCenterW: { value: _ringGlobalAtmoCenterArr },
+    uGlobalAtmoRadius: { value: _ringGlobalAtmoRadiusArr },
+    uLayerMode: { value: 0.0 },
     uRingTint: { value: _ringTintArr },
 
     // Global tuning (sliders)
     uOpacity: { value: ringDustParams.opacity },
     uDensity: { value: 34.0 },
+    uSteps: { value: dynRingDustSteps },
     uFade: { value: ringDustParams.fade },
     uNoiseScale: { value: ringDustParams.noiseScale },
     uWindSpeed: { value: ringDustParams.windSpeed },
@@ -2135,13 +2662,15 @@ void main() {
     uEclipseSoftness: { value: ringDustParams.eclipseSoftness },
     uEclipseStrength: { value: ringDustParams.eclipseStrength },
     uSunPosW: { value: new THREE.Vector3() },
+    uSunRadius: { value: SUN_RADIUS },
   };
 
   const ringDustMat = new THREE.ShaderMaterial({
-    transparent: true,
+    transparent: false,
     depthTest: false,
     depthWrite: false,
-    blending: THREE.NormalBlending,
+    blending: THREE.NoBlending,
+    toneMapped: false,
     uniforms: ringDustUniforms,
     vertexShader: atmoVS,
     fragmentShader: RING_DUST_POST_FS,
@@ -2162,6 +2691,9 @@ void main() {
       p.uniforms.uAtmoSteps.value = dynAtmoSteps;
       p.uniforms.uCloudSteps.value = dynCloudSteps;
       p.uniforms.uCloudLightSteps.value = dynCloudLightSteps;
+    }
+    if (ringDustPass?.uniforms?.uSteps) {
+      ringDustPass.uniforms.uSteps.value = dynRingDustSteps;
     }
   }
 
@@ -2188,6 +2720,8 @@ void main() {
       }
       if (godRayMat?.uniforms?.tDepth)
         godRayMat.uniforms.tDepth.value = rt.depthTexture;
+      if (tintMat?.uniforms?.tDepth)
+        tintMat.uniforms.tDepth.value = rt.depthTexture;
     }
 
     // Atmosphere + cloud buffers (also scaled dynamically)
@@ -2205,6 +2739,17 @@ void main() {
       if (atmoCopyMat) atmoCopyMat.uniforms.tAtmo.value = atmoRT.texture;
     }
 
+    const rw = Math.max(1, Math.floor(aw * RING_DUST_SCALE));
+    const rh = Math.max(1, Math.floor(ah * RING_DUST_SCALE));
+    if (!ringDustRT || ringDustRT.width !== rw || ringDustRT.height !== rh) {
+      if (ringDustRT) ringDustRT.dispose();
+      ringDustRT = makeColorRT(rw, rh);
+      ringDustRT.texture.colorSpace = THREE.NoColorSpace;
+      if (ringDustCompositeMat?.uniforms?.tTexture) {
+        ringDustCompositeMat.uniforms.tTexture.value = ringDustRT.texture;
+      }
+    }
+
     const cw = Math.max(
       1,
       Math.floor(innerWidth * QUALITY_CLOUD_SCALE * dynScale),
@@ -2215,20 +2760,58 @@ void main() {
     );
     if (!cloudRT || cloudRT.width !== cw || cloudRT.height !== ch) {
       if (cloudRT) cloudRT.dispose();
-      cloudRT = makeColorRT(cw, ch);
-      cloudRT.texture.colorSpace = THREE.NoColorSpace;
+      cloudRT = makeMaskRT(cw, ch);
       if (godRayMat?.uniforms?.tCloud)
         godRayMat.uniforms.tCloud.value = cloudRT.texture;
+    }
+
+    renderer.getDrawingBufferSize(_drawingBufferSize);
+    const gw = Math.max(
+      1,
+      Math.floor(_drawingBufferSize.x * QUALITY_GODRAY_SCALE * dynScale),
+    );
+    const gh = Math.max(
+      1,
+      Math.floor(_drawingBufferSize.y * QUALITY_GODRAY_SCALE * dynScale),
+    );
+    if (!godRayRT || godRayRT.width !== gw || godRayRT.height !== gh) {
+      if (godRayRT) godRayRT.dispose();
+      godRayRT = makeColorRT(gw, gh);
+      godRayRT.texture.colorSpace = THREE.NoColorSpace;
+      if (godRayCompositeMat?.uniforms?.tTexture) {
+        godRayCompositeMat.uniforms.tTexture.value = godRayRT.texture;
+      }
+    }
+
+    // Match the main dynamic-resolution target. The final pass is upsampled
+    // once to the display, just like the normal scene copy.
+    const uw = w;
+    const uh = h;
+    if (!underwaterRT || underwaterRT.width !== uw || underwaterRT.height !== uh) {
+      if (underwaterRT) underwaterRT.dispose();
+      underwaterRT = makeUnderwaterRT(uw, uh);
+      if (tintMat?.uniforms?.tScene) {
+        tintMat.uniforms.tScene.value = underwaterRT.texture;
+      }
+    }
+    if (tintMat?.uniforms?.uResolution) {
+      tintMat.uniforms.uResolution.value.set(uw, uh);
     }
 
     // Dynamic sample counts
     if (godRayMat?.uniforms?.uSamples) {
       godRayMat.uniforms.uSamples.value = dynGodraySamples;
     }
+    if (ringDustPass?.uniforms?.uSteps) {
+      ringDustPass.uniforms.uSteps.value = dynRingDustSteps;
+    }
     // keep exported references fresh for other modules
     world.rt = rt;
     world.atmoRT = atmoRT;
     world.cloudRT = cloudRT;
+    world.ringDustRT = ringDustRT;
+    world.godRayRT = godRayRT;
+    world.underwaterRT = underwaterRT;
   }
 
   function applyQualityPreset(name) {
@@ -2237,79 +2820,47 @@ void main() {
     currentQuality = QUALITY_PRESETS[key] ? key : "Descktop";
     if (qualitySel) qualitySel.value = currentQuality;
 
-    QUALITY_POINT_SHADOW = preset.pointShadow;
     QUALITY_SPOT_SHADOW = preset.spotShadow;
     QUALITY_ATMO_SCALE = preset.atmoScale;
     QUALITY_CLOUD_SCALE = preset.cloudScale;
+    QUALITY_GODRAY_ENABLED = preset.godRays !== false;
     QUALITY_GODRAY_SAMPLES = preset.godRaySamples;
+    QUALITY_GODRAY_SCALE = preset.godRayScale ?? 0.5;
+    QUALITY_GODRAY_INTENSITY = preset.godRayIntensity ?? 0.08;
+    QUALITY_GODRAY_DENSITY = preset.godRayDensity ?? 0.7;
+    QUALITY_GODRAY_DECAY = preset.godRayDecay ?? 0.92;
+    QUALITY_GODRAY_WEIGHT = preset.godRayWeight ?? 0.18;
     QUALITY_ATMO_STEPS = preset.atmoSteps;
     QUALITY_CLOUD_STEPS = preset.cloudSteps;
     QUALITY_CLOUD_LIGHT_STEPS = preset.cloudLightSteps;
+    QUALITY_RING_DUST_STEPS = preset.ringDustSteps ?? 8;
 
     // Pixel ratio clamp (huge perf win on 4K/retina)
     const prMax = preset.pixelRatioMax ?? devicePixelRatio;
     renderer.setPixelRatio(Math.min(devicePixelRatio, prMax));
 
-    // Shadow updating
-    // Keep PointLight + SpotLight shadows on a stable, shared cadence to avoid
-    // mismatched update patterns (which can read as flicker).
-    //
-    // Exception: NASA keeps the original behavior (update every frame) for max
-    // stability/quality.
-    if (currentQuality === "NASA") {
-      renderer.shadowMap.autoUpdate = true;
-      SHADOW_INTERVAL = 0.0; // unused when autoUpdate=true
-    } else {
-      renderer.shadowMap.autoUpdate = false;
-
-      const FIXED_SHADOW_HZ = 30; // stable across non-NASA presets
-      SHADOW_INTERVAL = 1.0 / Math.max(5.0, FIXED_SHADOW_HZ);
-    }
-
-    // Toggle shadows + set resolution (point shadows are VERY expensive)
-    if (sunLight) {
-      const wantPoint = (QUALITY_POINT_SHADOW | 0) > 0;
-      sunLight.castShadow = wantPoint;
-      if (sunLight.shadow) {
-        if (wantPoint) {
-          sunLight.shadow.mapSize.set(
-            QUALITY_POINT_SHADOW,
-            QUALITY_POINT_SHADOW,
-          );
-        }
-        if (sunLight.shadow.map) {
-          sunLight.shadow.map.dispose();
-          sunLight.shadow.map = null;
-        }
-      }
-
-      const wantSpot = (QUALITY_SPOT_SHADOW | 0) > 0;
-      if (sunLight.shadowLight) {
-        sunLight.shadowLight.castShadow = wantSpot;
-        if (sunLight.shadowLight.shadow) {
-          if (wantSpot) {
-            sunLight.shadowLight.shadow.mapSize.set(
-              QUALITY_SPOT_SHADOW,
-              QUALITY_SPOT_SHADOW,
-            );
-          }
-          if (sunLight.shadowLight.shadow.map) {
-            sunLight.shadowLight.shadow.map.dispose();
-            sunLight.shadowLight.shadow.map = null;
-          }
-        }
-      }
-    }
+    // Apply the focused SpotLight shadow resolution from the quality preset.
+    applySpotShadowState({ rebuildMaps: true });
     // Reset dynamic scalers to the preset baseline
     dynScale = 1.0;
     dynAtmoSteps = QUALITY_ATMO_STEPS;
     dynCloudSteps = QUALITY_CLOUD_STEPS;
     dynCloudLightSteps = QUALITY_CLOUD_LIGHT_STEPS;
     dynGodraySamples = QUALITY_GODRAY_SAMPLES;
+    dynRingDustSteps = QUALITY_RING_DUST_STEPS;
+
+    if (godRayMat?.uniforms) {
+      godRayMat.uniforms.uSamples.value = dynGodraySamples;
+      godRayMat.uniforms.uDensity.value = QUALITY_GODRAY_DENSITY;
+      godRayMat.uniforms.uDecay.value = QUALITY_GODRAY_DECAY;
+      godRayMat.uniforms.uWeight.value = QUALITY_GODRAY_WEIGHT;
+      if (!QUALITY_GODRAY_ENABLED) godRayMat.uniforms.uIntensity.value = 0.0;
+    }
+    world.godRaysEnabled = QUALITY_GODRAY_ENABLED;
+    world.godRayIntensity = QUALITY_GODRAY_INTENSITY;
 
     applyQualityToAtmoPasses();
     rebuildRenderTargets();
-    renderer.shadowMap.needsUpdate = true;
 
     // Rebuild asteroid belt density for the new preset (keep layout constant)
     if (asteroidBelt && !isSystemTransitionActive()) {
@@ -2320,9 +2871,13 @@ void main() {
     if (!isSystemTransitionActive()) {
       rebuildPlanetRingsFromBodies();
     }
+
+    for (const body of bodies) {
+      body.setTerrainPatchBudget?.(preset.terrainPatchBudget);
+    }
+
     // keep exported quality fields in sync
     world.currentQuality = currentQuality;
-    world.SHADOW_INTERVAL = SHADOW_INTERVAL;
     world.SPL_MASK_INTERVAL = SPL_MASK_INTERVAL;
   }
 
@@ -2337,22 +2892,41 @@ void main() {
   // Input (pointer lock + keys + mouse look)
   ////////////////////////////////////////////////////////////////////////////////
 
+  function scaledSampleCount(base, minimum, multiplier) {
+    const maxCount = Math.max(1, Math.floor(base ?? 1));
+    const minCount = Math.min(
+      maxCount,
+      Math.max(1, Math.floor(minimum ?? 1)),
+    );
+    return Math.min(
+      maxCount,
+      Math.max(minCount, Math.floor(maxCount * multiplier)),
+    );
+  }
+
   function applyDynamicScale(scale) {
     // Scale render targets only (canvas pixel ratio stays quality-preset clamped).
     dynScale = THREE.MathUtils.clamp(scale, 0.6, 1.0);
     world.dynScale = dynScale;
 
-    // Also shave expensive samples a bit when we have to scale down.
+    // Shave samples when scaling down, but never exceed the selected preset.
     const stepMul = THREE.MathUtils.clamp(0.55 + 0.45 * dynScale, 0.55, 1.0);
-    dynAtmoSteps = Math.max(10, Math.floor(QUALITY_ATMO_STEPS * stepMul));
-    dynCloudSteps = Math.max(12, Math.floor(QUALITY_CLOUD_STEPS * stepMul));
-    dynCloudLightSteps = Math.max(
-      8,
-      Math.floor(QUALITY_CLOUD_LIGHT_STEPS * stepMul),
+    dynAtmoSteps = scaledSampleCount(QUALITY_ATMO_STEPS, 8, stepMul);
+    dynCloudSteps = scaledSampleCount(QUALITY_CLOUD_STEPS, 4, stepMul);
+    dynCloudLightSteps = scaledSampleCount(
+      QUALITY_CLOUD_LIGHT_STEPS,
+      2,
+      stepMul,
     );
-    dynGodraySamples = Math.max(
-      16,
-      Math.floor(QUALITY_GODRAY_SAMPLES * (0.6 + 0.4 * dynScale)),
+    dynGodraySamples = scaledSampleCount(
+      QUALITY_GODRAY_SAMPLES,
+      6,
+      stepMul,
+    );
+    dynRingDustSteps = scaledSampleCount(
+      QUALITY_RING_DUST_STEPS,
+      6,
+      stepMul,
     );
 
     applyQualityToAtmoPasses();
@@ -2378,6 +2952,8 @@ void main() {
     planetRings,
     setRingDustParams,
     getRingDustParams: () => ({ ...ringDustParams }),
+    setShadowBiasParams,
+    getShadowBiasParams,
     // separate list for HUD + moon-specific behaviors (moons are also included in `bodies`)
     moons,
     sun,
@@ -2391,10 +2967,17 @@ void main() {
     rt,
     atmoRT,
     cloudRT,
+    ringDustRT,
+    godRayRT,
+    underwaterRT,
     copyScene,
     copyMat,
     atmoCopyScene,
     atmoCopyMat,
+    ringDustCompositeScene,
+    ringDustCompositeMat,
+    godRayCompositeScene,
+    godRayCompositeMat,
     atmoScene,
     atmoPasses,
     beltDustPass,
@@ -2404,6 +2987,12 @@ void main() {
     postScene,
     tintMat,
     particlesMat,
+    volumeNoiseTex,
+    volumeNoiseLayout,
+    cloudNoiseTex,
+    cloudNoiseTex3D,
+    cloudNoiseLayout,
+    cloudNoiseMode: useCloudNoise3D ? "3d" : "atlas",
 
     // eclipse buffers + helpers
     MAX_OCCLUDERS,
@@ -2411,6 +3000,7 @@ void main() {
     occluderRadii,
     fillOccludersForBody,
     sunVisibilityCPU,
+    getEclipseBodyRadius: bodyRadiusForEclipse,
 
     // system/quality hooks
     rebuildRenderTargets,
@@ -2431,7 +3021,6 @@ void main() {
     // dynamic fields (kept current by applyQualityPreset / applyDynamicScale)
     currentQuality,
     dynScale,
-    SHADOW_INTERVAL,
     SPL_MASK_INTERVAL,
   });
 

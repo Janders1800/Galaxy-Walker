@@ -32,6 +32,8 @@ export function createGalaxyOverlay({
     }
 
     const ctx = canvasEl?.getContext?.("2d", { alpha: false }) ?? null;
+    const targetStatusEl = document.getElementById("galaxyTargetStatus");
+    const warpStatusEl = document.getElementById("galaxyWarpStatus");
 
     let isOpen = false;
 
@@ -53,6 +55,22 @@ export function createGalaxyOverlay({
     let galaxyStars = [];
     let gGrid = new Map();
 
+    // The catalog is rasterized into one offscreen surface instead of issuing
+    // thousands of Canvas2D path/fill calls every animation frame. OffscreenCanvas
+    // keeps this out of the DOM where supported; the fallback is still only one
+    // hidden canvas, never one element per star.
+    const starLayer = typeof OffscreenCanvas !== "undefined"
+        ? new OffscreenCanvas(1, 1)
+        : document.createElement("canvas");
+    const starCtx = starLayer.getContext("2d", { alpha: true });
+    let starLayerDirty = true;
+    let starLayerDrawn = 0;
+    let starLayerDpr = 1;
+
+    function invalidateStarLayer() {
+        starLayerDirty = true;
+    }
+
     function regen() {
         const field = createGalaxyField({
             seed: GALAXY_SEED,
@@ -71,6 +89,7 @@ export function createGalaxyOverlay({
         });
         galaxyStars = field.stars;
         gGrid = field.grid;
+        invalidateStarLayer();
     }
 
     regen();
@@ -81,6 +100,14 @@ export function createGalaxyOverlay({
         canvasEl.width = Math.floor(innerWidth * dpr);
         canvasEl.height = Math.floor(innerHeight * dpr);
         ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+        if (starCtx) {
+            starLayerDpr = dpr;
+            starLayer.width = canvasEl.width;
+            starLayer.height = canvasEl.height;
+            starCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            invalidateStarLayer();
+        }
     }
 
     function open() {
@@ -96,6 +123,11 @@ export function createGalaxyOverlay({
         // Start centered on current system
         gPanX = galaxyPlayer.x;
         gPanZ = galaxyPlayer.z;
+        invalidateStarLayer();
+        if (gSelected < 0) {
+            if (targetStatusEl) targetStatusEl.textContent = "No target selected";
+            if (warpStatusEl) warpStatusEl.textContent = "Select a star";
+        }
     }
 
     function close() {
@@ -115,74 +147,30 @@ export function createGalaxyOverlay({
         return base / gZoom;
     }
 
-    function draw() {
-        if (!isOpen || !ctx) return;
+    function renderStarLayer({
+        w,
+        h,
+        cx,
+        cy,
+        upp,
+        minX,
+        maxX,
+        minZ,
+        maxZ,
+    }) {
+        if (!starCtx) return 0;
 
-        const w = innerWidth;
-        const h = innerHeight;
-        const cx = w * 0.5;
-        const cy = h * 0.5;
+        // Width/height assignment resets the transform, so restore DPR before
+        // drawing in CSS-pixel coordinates.
+        starCtx.setTransform(starLayerDpr, 0, 0, starLayerDpr, 0, 0);
+        starCtx.clearRect(0, 0, w, h);
+        starCtx.save();
+        starCtx.globalCompositeOperation = "lighter";
 
-        // background
-        ctx.clearRect(0, 0, w, h);
-        ctx.fillStyle = "rgba(0,0,0,1)";
-        ctx.fillRect(0, 0, w, h);
-
-        // vignette
-        const R = Math.min(w, h) * 0.55;
-        const grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, R);
-        grad.addColorStop(0.0, "rgba(0,0,0,0.0)");
-        grad.addColorStop(1.0, "rgba(0,0,0,0.6)");
-        ctx.fillStyle = grad;
-        ctx.fillRect(0, 0, w, h);
-
-        // Subtle galaxy background glow that scales with the galaxy
-        {
-            const upp = galaxyUnitsPerPixel();
-            const coreX = cx + (0 - gPanX) / upp;
-            const coreY = cy + (0 - gPanZ) / upp;
-
-            // Convert galaxy-space radius -> screen-space pixels
-            let Rpx = HAZE_RADIUS_UNITS / upp;
-
-            // Clamp so it doesn't get ridiculous when very zoomed in/out
-            Rpx = Math.max(
-                Math.min(w, h) * 0.35,
-                Math.min(Rpx, Math.max(w, h) * 2.2),
-            );
-
-            const g = ctx.createRadialGradient(coreX, coreY, 0, coreX, coreY, Rpx);
-            g.addColorStop(0.0, "rgba(80,160,255,0.10)");
-            g.addColorStop(0.22, "rgba(60,130,255,0.06)");
-            g.addColorStop(0.6, "rgba(40, 90,220,0.03)");
-            g.addColorStop(1.0, "rgba(0,0,0,0.00)");
-
-            ctx.save();
-            ctx.globalCompositeOperation = "screen";
-            ctx.fillStyle = g;
-            ctx.fillRect(0, 0, w, h);
-            ctx.restore();
-        }
-
-        const upp = galaxyUnitsPerPixel();
-        const halfW = w * 0.5 * upp;
-        const halfH = h * 0.5 * upp;
-
-        const minX = gPanX - halfW;
-        const maxX = gPanX + halfW;
-        const minZ = gPanZ - halfH;
-        const maxZ = gPanZ + halfH;
-
-        // grid cells visible
         const ix0 = Math.floor(minX / CELL);
         const ix1 = Math.floor(maxX / CELL);
         const iz0 = Math.floor(minZ / CELL);
         const iz1 = Math.floor(maxZ / CELL);
-
-        // draw stars (cap count for perf)
-        ctx.save();
-        ctx.globalCompositeOperation = "lighter";
-
         const MAX_DRAW = 30000;
         let drawn = 0;
 
@@ -197,18 +185,17 @@ export function createGalaxyOverlay({
 
                     const px = cx + (s.x - gPanX) / upp;
                     const py = cy + (s.z - gPanZ) / upp;
-
-                    const base = 1.0 + (1.0 - s.mag) * 2.4;
+                    const base = 0.9 + (1.0 - s.mag) * 2.25;
                     const rad = Math.max(
-                        0.6,
-                        Math.min(3.4, base * (0.55 + 0.45 * Math.sqrt(gZoom))),
+                        0.55,
+                        Math.min(3.2, base * (0.55 + 0.45 * Math.sqrt(gZoom))),
                     );
-                    const alpha = 0.1 + (1.0 - s.mag) * 0.7;
+                    const alpha = 0.12 + (1.0 - s.mag) * 0.72;
 
-                    ctx.fillStyle = s.col + alpha.toFixed(3) + ")";
-                    ctx.beginPath();
-                    ctx.arc(px, py, rad, 0, Math.PI * 2);
-                    ctx.fill();
+                    starCtx.fillStyle = s.col + alpha.toFixed(3) + ")";
+                    starCtx.beginPath();
+                    starCtx.arc(px, py, rad, 0, Math.PI * 2);
+                    starCtx.fill();
 
                     if (++drawn >= MAX_DRAW) break;
                 }
@@ -217,65 +204,200 @@ export function createGalaxyOverlay({
             if (drawn >= MAX_DRAW) break;
         }
 
+        starCtx.restore();
+        starLayerDrawn = drawn;
+        starLayerDirty = false;
+        return drawn;
+    }
+
+    function draw() {
+        if (!isOpen || !ctx) return;
+
+        const w = innerWidth;
+        const h = innerHeight;
+        const cx = w * 0.5;
+        const cy = h * 0.5;
+
+        ctx.clearRect(0, 0, w, h);
+        ctx.fillStyle = "rgb(0,4,7)";
+        ctx.fillRect(0, 0, w, h);
+
+        const upp = galaxyUnitsPerPixel();
+        const halfW = w * 0.5 * upp;
+        const halfH = h * 0.5 * upp;
+        const minX = gPanX - halfW;
+        const maxX = gPanX + halfW;
+        const minZ = gPanZ - halfH;
+        const maxZ = gPanZ + halfH;
+
+        // Low-cost navigation grid with adaptive spacing.
+        let gridStep = CELL;
+        while (gridStep / upp < 72) gridStep *= 2;
+        while (gridStep > CELL && gridStep / upp > 180) gridStep *= 0.5;
+
+        ctx.save();
+        ctx.lineWidth = 1;
+        ctx.font = "8px ui-monospace, SFMono-Regular, Consolas, monospace";
+        ctx.fillStyle = "rgba(120,246,255,0.24)";
+        ctx.textBaseline = "top";
+
+        let gxLine = Math.floor(minX / gridStep) * gridStep;
+        for (let guard = 0; gxLine <= maxX && guard < 80; guard++, gxLine += gridStep) {
+            const x = cx + (gxLine - gPanX) / upp;
+            const major = Math.round(gxLine / gridStep) % 4 === 0;
+            ctx.strokeStyle = major
+                ? "rgba(120,246,255,0.085)"
+                : "rgba(120,246,255,0.038)";
+            ctx.beginPath();
+            ctx.moveTo(x + 0.5, 0);
+            ctx.lineTo(x + 0.5, h);
+            ctx.stroke();
+            if (major && x > 72 && x < w - 72) {
+                ctx.fillText(`${Math.round(gxLine / 1000)}K`, x + 4, h - 30);
+            }
+        }
+
+        let gzLine = Math.floor(minZ / gridStep) * gridStep;
+        for (let guard = 0; gzLine <= maxZ && guard < 80; guard++, gzLine += gridStep) {
+            const y = cy + (gzLine - gPanZ) / upp;
+            const major = Math.round(gzLine / gridStep) % 4 === 0;
+            ctx.strokeStyle = major
+                ? "rgba(120,246,255,0.085)"
+                : "rgba(120,246,255,0.038)";
+            ctx.beginPath();
+            ctx.moveTo(0, y + 0.5);
+            ctx.lineTo(w, y + 0.5);
+            ctx.stroke();
+        }
         ctx.restore();
 
-        // galactic core (0,0)
+        // Galaxy-scaled core haze.
+        {
+            const coreX = cx + (0 - gPanX) / upp;
+            const coreY = cy + (0 - gPanZ) / upp;
+            let Rpx = HAZE_RADIUS_UNITS / upp;
+            Rpx = Math.max(
+                Math.min(w, h) * 0.35,
+                Math.min(Rpx, Math.max(w, h) * 2.2),
+            );
+
+            const g = ctx.createRadialGradient(coreX, coreY, 0, coreX, coreY, Rpx);
+            g.addColorStop(0.0, "rgba(84,172,255,0.105)");
+            g.addColorStop(0.22, "rgba(54,125,236,0.062)");
+            g.addColorStop(0.62, "rgba(25,72,170,0.025)");
+            g.addColorStop(1.0, "rgba(0,0,0,0)");
+            ctx.save();
+            ctx.globalCompositeOperation = "screen";
+            ctx.fillStyle = g;
+            ctx.fillRect(0, 0, w, h);
+            ctx.restore();
+        }
+
+        // Star catalog: one cached raster blit per frame. The expensive star
+        // paths are rebuilt only when pan/zoom/resize/catalog state changes.
+        if (starLayerDirty) {
+            renderStarLayer({ w, h, cx, cy, upp, minX, maxX, minZ, maxZ });
+        }
+        const drawn = starLayerDrawn;
+        if (starCtx && starLayer.width > 0 && starLayer.height > 0) {
+            ctx.save();
+            ctx.globalCompositeOperation = "lighter";
+            ctx.drawImage(starLayer, 0, 0, starLayer.width, starLayer.height, 0, 0, w, h);
+            ctx.restore();
+        }
+
+        // Galactic core marker.
         {
             const gx = cx + (0 - gPanX) / upp;
             const gy = cy + (0 - gPanZ) / upp;
-            ctx.fillStyle = "rgba(255,220,180,0.7)";
+            ctx.fillStyle = "rgba(255,208,132,0.82)";
             ctx.beginPath();
             ctx.arc(gx, gy, 4.2, 0, Math.PI * 2);
             ctx.fill();
-            ctx.strokeStyle = "rgba(255,220,180,0.25)";
+            ctx.strokeStyle = "rgba(255,208,132,0.28)";
+            ctx.lineWidth = 1;
             ctx.beginPath();
-            ctx.arc(gx, gy, 22, 0, Math.PI * 2);
+            ctx.arc(gx, gy, 18, -0.35, 0.35);
+            ctx.arc(gx, gy, 18, Math.PI - 0.35, Math.PI + 0.35);
             ctx.stroke();
         }
 
-        // player marker (world XZ as proxy)
+        // Current-system marker.
         {
-            const pxw = galaxyPlayer.x;
-            const pzw = galaxyPlayer.z;
-            const px = cx + (pxw - gPanX) / upp;
-            const py = cy + (pzw - gPanZ) / upp;
-
-            ctx.fillStyle = "rgba(120,220,255,0.95)";
-            ctx.beginPath();
-            ctx.arc(px, py, 4.0, 0, Math.PI * 2);
-            ctx.fill();
-            ctx.strokeStyle = "rgba(120,220,255,0.25)";
-            ctx.beginPath();
-            ctx.arc(px, py, 16.0, 0, Math.PI * 2);
-            ctx.stroke();
+            const px = cx + (galaxyPlayer.x - gPanX) / upp;
+            const py = cy + (galaxyPlayer.z - gPanZ) / upp;
+            ctx.save();
+            ctx.translate(px, py);
+            ctx.rotate(Math.PI * 0.25);
+            ctx.fillStyle = "rgba(120,246,255,0.98)";
+            ctx.fillRect(-3.5, -3.5, 7, 7);
+            ctx.strokeStyle = "rgba(120,246,255,0.34)";
+            ctx.strokeRect(-10.5, -10.5, 21, 21);
+            ctx.restore();
         }
 
-        // selected star highlight
+        // Selected-star targeting brackets.
         if (gSelected >= 0) {
             const s = galaxyStars[gSelected];
             const sx = cx + (s.x - gPanX) / upp;
             const sy = cy + (s.z - gPanZ) / upp;
+            const r = 19;
+            const arm = 7;
 
-            ctx.strokeStyle = "rgba(255,255,255,0.85)";
-            ctx.lineWidth = 2;
+            ctx.strokeStyle = "rgba(183,251,255,0.92)";
+            ctx.lineWidth = 1.4;
             ctx.beginPath();
-            ctx.arc(sx, sy, 18, 0, Math.PI * 2);
+            ctx.moveTo(sx - r, sy - r + arm);
+            ctx.lineTo(sx - r, sy - r);
+            ctx.lineTo(sx - r + arm, sy - r);
+            ctx.moveTo(sx + r - arm, sy - r);
+            ctx.lineTo(sx + r, sy - r);
+            ctx.lineTo(sx + r, sy - r + arm);
+            ctx.moveTo(sx + r, sy + r - arm);
+            ctx.lineTo(sx + r, sy + r);
+            ctx.lineTo(sx + r - arm, sy + r);
+            ctx.moveTo(sx - r + arm, sy + r);
+            ctx.lineTo(sx - r, sy + r);
+            ctx.lineTo(sx - r, sy + r - arm);
             ctx.stroke();
-            ctx.lineWidth = 1;
 
-            ctx.fillStyle = "rgba(255,255,255,0.85)";
-            ctx.font = "13px system-ui, -apple-system, Segoe UI, Roboto, sans-serif";
-            ctx.fillText(`Selected: #${gSelected}`, sx + 22, sy + 4);
+            ctx.fillStyle = "rgba(183,251,255,0.88)";
+            ctx.font = "10px ui-monospace, SFMono-Regular, Consolas, monospace";
+            ctx.fillText(`STAR-${String(gSelected).padStart(3, "0")}`, sx + 27, sy + 4);
         }
 
-        // corner stats
-        ctx.fillStyle = "rgba(255,255,255,0.65)";
-        ctx.font = "12px system-ui, -apple-system, Segoe UI, Roboto, sans-serif";
+        // Instrument readouts at canvas level.
+        ctx.fillStyle = "rgba(176,224,234,0.52)";
+        ctx.font = "9px ui-monospace, SFMono-Regular, Consolas, monospace";
         ctx.fillText(
-            `Stars: ${STAR_COUNT.toLocaleString()} | Zoom: ${gZoom.toFixed(2)}x`,
-            12,
-            h - 16,
+            `CATALOG ${STAR_COUNT.toLocaleString()} // VISIBLE ${drawn.toLocaleString()} // RANGE ${gZoom.toFixed(2)}X`,
+            18,
+            h - 18,
         );
+
+        const scalePx = 120;
+        const scaleUnits = scalePx * upp;
+        ctx.strokeStyle = "rgba(120,246,255,0.42)";
+        ctx.beginPath();
+        ctx.moveTo(w - 158, h - 20.5);
+        ctx.lineTo(w - 38, h - 20.5);
+        ctx.moveTo(w - 158, h - 25);
+        ctx.lineTo(w - 158, h - 16);
+        ctx.moveTo(w - 38, h - 25);
+        ctx.lineTo(w - 38, h - 16);
+        ctx.stroke();
+        ctx.fillStyle = "rgba(183,251,255,0.62)";
+        ctx.textAlign = "center";
+        ctx.fillText(`${Math.max(1, Math.round(scaleUnits / 1000))}K LY`, w - 98, h - 34);
+        ctx.textAlign = "start";
+
+        // Edge vignette keeps the map legible without a CSS backdrop filter.
+        const vignetteR = Math.max(w, h) * 0.72;
+        const vignette = ctx.createRadialGradient(cx, cy, Math.min(w, h) * 0.22, cx, cy, vignetteR);
+        vignette.addColorStop(0, "rgba(0,0,0,0)");
+        vignette.addColorStop(1, "rgba(0,0,0,0.58)");
+        ctx.fillStyle = vignette;
+        ctx.fillRect(0, 0, w, h);
     }
 
     // Input listeners
@@ -288,6 +410,7 @@ export function createGalaxyOverlay({
             // center on player
             gPanX = galaxyPlayer.x;
             gPanZ = galaxyPlayer.z;
+            invalidateStarLayer();
         }
     }
 
@@ -317,6 +440,7 @@ export function createGalaxyOverlay({
         const upp = galaxyUnitsPerPixel();
         gPanX -= dx * upp;
         gPanZ -= dy * upp;
+        invalidateStarLayer();
     }
 
     function onWheel(e) {
@@ -324,6 +448,7 @@ export function createGalaxyOverlay({
         e.preventDefault();
         const zoomFactor = Math.pow(1.12, -Math.sign(e.deltaY));
         gZoom = Math.min(40.0, Math.max(0.08, gZoom * zoomFactor));
+        invalidateStarLayer();
     }
 
     // Double-click handling
@@ -376,6 +501,12 @@ export function createGalaxyOverlay({
 
         // select the star
         gSelected = best;
+        if (targetStatusEl) {
+            targetStatusEl.textContent = `STAR-${String(best).padStart(3, "0")} selected`;
+        }
+        if (warpStatusEl) {
+            warpStatusEl.textContent = "Double-click to warp";
+        }
 
         // double click on the SAME star
         const now = performance.now();
@@ -401,6 +532,9 @@ export function createGalaxyOverlay({
                 // Warp is only allowed in fly mode.
                 try {
                     if (player?.mode !== "fly") {
+                        if (warpStatusEl) {
+                            warpStatusEl.textContent = "Take off before warping";
+                        }
                         lastClickStar = -1;
                         lastClickTime = 0;
                         return;
@@ -411,6 +545,8 @@ export function createGalaxyOverlay({
 
                 const started = warpCtrl.start(targetDesc);
                 if (started) {
+                    if (targetStatusEl) targetStatusEl.textContent = `${targetDesc.name} locked`;
+                    if (warpStatusEl) warpStatusEl.textContent = "Warping";
                     lastClickStar = -1;
                     lastClickTime = 0;
                     close();
@@ -419,6 +555,7 @@ export function createGalaxyOverlay({
                 // No warp system in this build — just center the map on the selected star.
                 gPanX = s.x;
                 gPanZ = s.z;
+                invalidateStarLayer();
                 if (msgEl) {
                     msgEl.textContent = `Selected ${targetDesc.name} (warp not enabled in this build).`;
                 }

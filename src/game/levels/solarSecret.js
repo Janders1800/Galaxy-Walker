@@ -48,7 +48,7 @@ export function buildSolarSecretSystem(env, baseSeed) {
   try {
     sun.material.color.setHex(0xffcc66);
     sun.material.emissive.setHex(0xffaa33);
-    sun.material.emissiveIntensity = 2.8;
+    sun.material.emissiveIntensity = 10.0;
   } catch {}
 
   // Update galaxy marker

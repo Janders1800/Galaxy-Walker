@@ -1,5 +1,8 @@
-// Local system minimap (orbit rings + bodies) rendered into #galaxyMap canvas.
-// Extracted from src/main.js to keep the entrypoint smaller.
+// Local system minimap rendered into #galaxyMap canvas.
+// Readability-first presentation:
+// - remove generic decorative/range circles
+// - draw real orbit guides for planets and moons
+// - improve body markers/highlights so the current system is easier to parse
 
 export function createGalaxyMiniMap({
     THREE,
@@ -18,15 +21,16 @@ export function createGalaxyMiniMap({
     }
 
     const ctx = canvasEl?.getContext?.("2d", { alpha: true }) ?? null;
+    const shellEl = canvasEl?.closest?.("#galaxyMapShell")
+        ?? document.getElementById("galaxyMapShell");
 
     let isOn = !!defaultOn;
     let zoom = defaultZoom;
 
     const _mapV = new THREE.Vector3();
+    const _mapDir = new THREE.Vector3();
+    const _mapParent = new THREE.Vector3();
 
-    // Allow callers to pass extra scene objects (like asteroid belts) without
-    // breaking or slowing the minimap. Anything tagged with userData.ignoreMiniMap
-    // (or ignoreMinimap) will be skipped.
     function isIgnored(b) {
         const g = b?.group;
         const ud = g?.userData || b?.userData;
@@ -47,13 +51,13 @@ export function createGalaxyMiniMap({
         const rect = canvasEl.getBoundingClientRect();
         canvasEl.width = Math.floor(rect.width * dpr);
         canvasEl.height = Math.floor(rect.height * dpr);
-        // Draw in CSS pixels.
         ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     }
 
     function setOn(v) {
         isOn = !!v;
         canvasEl?.classList?.toggle("off", !isOn);
+        shellEl?.classList?.toggle("off", !isOn);
     }
 
     function toggle() {
@@ -65,10 +69,7 @@ export function createGalaxyMiniMap({
     }
 
     function onKeyDown(e) {
-        if (e.code === "KeyM") {
-            toggle();
-        }
-        // '+' is usually 'Equal' without shift on US layouts; keep the original behavior.
+        if (e.code === "KeyM") toggle();
         if (e.code === "Equal") setZoom(zoom * 1.12);
         if (e.code === "Minus") setZoom(zoom / 1.12);
     }
@@ -77,10 +78,22 @@ export function createGalaxyMiniMap({
         resize();
     }
 
+    function drawBodyLabel(name, x, y, emphasized = false) {
+        if (!name) return;
+        ctx.font = emphasized
+            ? "10px ui-monospace, SFMono-Regular, Consolas, monospace"
+            : "9px ui-monospace, SFMono-Regular, Consolas, monospace";
+        ctx.textBaseline = "middle";
+        ctx.fillStyle = emphasized
+            ? "rgba(211,252,255,0.92)"
+            : "rgba(171,227,235,0.82)";
+        ctx.fillText(String(name).toUpperCase(), x + 10, y);
+    }
+
     function draw() {
         if (!isOn || !canvasEl || !ctx) return;
 
-        const bodies = getBodies?.() ?? [];
+        const bodies = (getBodies?.() ?? []).filter((b) => !isIgnored(b));
         const rect = canvasEl.getBoundingClientRect();
         const w = rect.width;
         const h = rect.height;
@@ -88,30 +101,60 @@ export function createGalaxyMiniMap({
 
         const cx = w * 0.5;
         const cy = h * 0.5;
-        const R = Math.min(w, h) * 0.46;
-
-        // Find max orbit distance.
-        let maxOrbit = 1;
-        for (const b of bodies) {
-            if (isIgnored(b)) continue;
-            const od = b?.cfg?.orbitDist ?? 0;
-            if (od > maxOrbit) maxOrbit = od;
-        }
-        maxOrbit = maxOrbit * 1.06 + 1200;
-        const scale = (R / maxOrbit) * zoom;
-
-        // Minimap follow + clamp to map bounds
+        const R = Math.min(w, h) * 0.455;
         const clamp = (v, a, b) => Math.min(Math.max(v, a), b);
+
+        const bodyByGroup = new Map();
+        for (const b of bodies) {
+            if (b?.group) bodyByGroup.set(b.group, b);
+        }
+
+        const bodyInfo = [];
+        let maxExtent = 1;
+        for (let i = 0; i < bodies.length; i++) {
+            const b = bodies[i];
+            if (!b?.group?.getWorldPosition) continue;
+
+            b.group.getWorldPosition(_mapV);
+            const parentBody = bodyByGroup.get(b.group.parent) ?? null;
+            let orbitCenterX = 0;
+            let orbitCenterZ = 0;
+            let isMoon = false;
+            if (parentBody?.group?.getWorldPosition) {
+                parentBody.group.getWorldPosition(_mapParent);
+                orbitCenterX = _mapParent.x;
+                orbitCenterZ = _mapParent.z;
+                isMoon = true;
+            }
+
+            const orbitDist = b?.cfg?.orbitDist ?? 0;
+            const centerRadius = Math.hypot(orbitCenterX, orbitCenterZ);
+            const bodyRadius = Math.hypot(_mapV.x, _mapV.z);
+            maxExtent = Math.max(maxExtent, bodyRadius + 300);
+            if (orbitDist > 0) maxExtent = Math.max(maxExtent, centerRadius + orbitDist + 300);
+
+            bodyInfo.push({
+                index: i,
+                body: b,
+                worldX: _mapV.x,
+                worldZ: _mapV.z,
+                parentBody,
+                orbitCenterX,
+                orbitCenterZ,
+                orbitDist,
+                isMoon,
+            });
+        }
+
+        maxExtent = maxExtent * 1.05 + 800;
+        const scale = (R / maxExtent) * zoom;
 
         const pwp = getPlayerWorldPos?.();
         const desiredPanX = pwp?.x ?? camera?.position?.x ?? 0;
         const desiredPanZ = pwp?.z ?? camera?.position?.z ?? 0;
-
-        // Visible radius in world units. At zoom=1 this == maxOrbit.
-        const viewRadius = maxOrbit / zoom;
-
-        const minPan = -maxOrbit + viewRadius;
-        const maxPan = maxOrbit - viewRadius;
+        const viewRadius = maxExtent / zoom;
+        const minPan = -maxExtent + viewRadius;
+        const maxPan = maxExtent - viewRadius;
 
         let mapPanX = 0;
         let mapPanZ = 0;
@@ -125,129 +168,188 @@ export function createGalaxyMiniMap({
 
         ctx.clearRect(0, 0, w, h);
 
-        // Soft vignette
-        const g = ctx.createRadialGradient(cx, cy, 0, cx, cy, R * 1.05);
-        g.addColorStop(0.0, "rgba(0,0,0,0.00)");
-        g.addColorStop(1.0, "rgba(0,0,0,0.55)");
-        ctx.fillStyle = "rgba(0,0,0,0.22)";
-        ctx.fillRect(0, 0, w, h);
-        ctx.fillStyle = g;
-        ctx.fillRect(0, 0, w, h);
-
-        // Clip rings/bodies to the minimap circle
         ctx.save();
         ctx.beginPath();
         ctx.arc(cx, cy, R, 0, Math.PI * 2);
         ctx.clip();
 
-        // Grid-ish range rings
+        const bg = ctx.createRadialGradient(cx, cy, 0, cx, cy, R);
+        bg.addColorStop(0, "rgba(8,33,45,0.94)");
+        bg.addColorStop(0.68, "rgba(3,16,24,0.96)");
+        bg.addColorStop(1, "rgba(1,7,11,0.99)");
+        ctx.fillStyle = bg;
+        ctx.fillRect(0, 0, w, h);
+
+        // Simple crosshair through the system origin.
         ctx.save();
-        ctx.translate(originX, originY);
+        ctx.strokeStyle = "rgba(112,238,255,0.12)";
         ctx.lineWidth = 1;
-        ctx.strokeStyle = "rgba(255,255,255,0.07)";
-        const step = 2000;
-        const rings = Math.floor(maxOrbit / step);
-        for (let i = 1; i <= rings; i++) {
-            const rr = i * step * scale;
+        ctx.setLineDash([3, 6]);
+        ctx.beginPath();
+        ctx.moveTo(0, originY + 0.5);
+        ctx.lineTo(w, originY + 0.5);
+        ctx.moveTo(originX + 0.5, 0);
+        ctx.lineTo(originX + 0.5, h);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.restore();
+
+        // Actual orbit guides only.
+        ctx.save();
+        ctx.lineWidth = 1;
+        for (const info of bodyInfo) {
+            if (!(info.orbitDist > 0)) continue;
+            const ox = originX + info.orbitCenterX * scale;
+            const oy = originY + info.orbitCenterZ * scale;
+            const rr = info.orbitDist * scale;
+            if (rr < 1.2) continue;
+            ctx.strokeStyle = info.isMoon
+                ? "rgba(144,216,230,0.22)"
+                : "rgba(116,246,255,0.30)";
             ctx.beginPath();
-            ctx.arc(0, 0, rr, 0, Math.PI * 2);
+            ctx.arc(ox, oy, rr, 0, Math.PI * 2);
             ctx.stroke();
         }
         ctx.restore();
 
-        // Orbit rings
+        // Star / system center.
         ctx.save();
         ctx.translate(originX, originY);
-        ctx.strokeStyle = "rgba(255,255,255,0.12)";
-        for (const b of bodies) {
-            if (isIgnored(b)) continue;
-            const od = b?.cfg?.orbitDist ?? 0;
-            if (od <= 0) continue;
-            const rr = od * scale;
-            ctx.beginPath();
-            ctx.arc(0, 0, rr, 0, Math.PI * 2);
-            ctx.stroke();
-        }
-        ctx.restore();
-
-        // Star at origin
-        ctx.save();
-        ctx.translate(originX, originY);
-        ctx.fillStyle = "rgba(255, 210, 140, 0.95)";
+        const starGlow = ctx.createRadialGradient(0, 0, 0, 0, 0, 18);
+        starGlow.addColorStop(0, "rgba(255,232,163,1.0)");
+        starGlow.addColorStop(0.45, "rgba(255,205,112,0.96)");
+        starGlow.addColorStop(1, "rgba(255,205,112,0.0)");
+        ctx.fillStyle = starGlow;
         ctx.beginPath();
-        ctx.arc(0, 0, 4.5, 0, Math.PI * 2);
+        ctx.arc(0, 0, 18, 0, Math.PI * 2);
         ctx.fill();
-        ctx.fillStyle = "rgba(255, 210, 140, 0.22)";
+        ctx.fillStyle = "rgba(255,214,118,1.0)";
         ctx.beginPath();
-        ctx.arc(0, 0, 16, 0, Math.PI * 2);
+        ctx.arc(0, 0, 4.6, 0, Math.PI * 2);
         ctx.fill();
+        ctx.strokeStyle = "rgba(255,214,118,0.34)";
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.arc(0, 0, 11.5, 0, Math.PI * 2);
+        ctx.stroke();
         ctx.restore();
-
-        // End minimap clip
-        ctx.restore();
-
-        // Bodies + labels
-        ctx.save();
-        ctx.font = "11px system-ui, -apple-system, Segoe UI, Roboto, sans-serif";
-        ctx.textBaseline = "middle";
 
         const nearInfo = nearestBodyInfo?.(camera?.position) ?? null;
         const nearestIndex = nearInfo?.i ?? -1;
 
-        for (let i = 0; i < bodies.length; i++) {
-            const b = bodies[i];
-            if (isIgnored(b)) continue;
-            if (!b?.group?.getWorldPosition) continue;
-            b.group.getWorldPosition(_mapV);
-
-            const x = originX + _mapV.x * scale;
-            const y = originY + _mapV.z * scale;
-            if (x < -40 || x > w + 40 || y < -40 || y > h + 40) continue;
+        // Bodies.
+        ctx.save();
+        for (const info of bodyInfo) {
+            const { index, body: b, worldX, worldZ, isMoon } = info;
+            const x = originX + worldX * scale;
+            const y = originY + worldZ * scale;
+            const dx = x - cx;
+            const dy = y - cy;
+            if (dx * dx + dy * dy > (R + 24) * (R + 24)) continue;
 
             const baseR = b?.cfg?.baseRadius ?? 1400;
-            const dot = THREE.MathUtils.clamp(2.2 + (baseR / 1400) * 1.2, 2.0, 4.2);
+            const markerR = isMoon
+                ? THREE.MathUtils.clamp(1.6 + (baseR / 800) * 0.55, 1.8, 3.2)
+                : THREE.MathUtils.clamp(2.5 + (baseR / 1400) * 1.1, 2.5, 5.4);
+            const isHi = index === nearestIndex;
+            const name = b?.cfg?.name ?? `P${index + 1}`;
 
-            const isHi = i === nearestIndex;
-            const name = b?.cfg?.name ?? `P${i + 1}`;
-
+            ctx.strokeStyle = isMoon
+                ? "rgba(221,245,250,0.56)"
+                : "rgba(220,247,252,0.42)";
+            ctx.lineWidth = 1;
             ctx.beginPath();
+            ctx.arc(x, y, markerR + 1.2, 0, Math.PI * 2);
+            ctx.stroke();
+
             ctx.fillStyle = hexToCss(b?.cfg?.color ?? 0xffffff);
-            ctx.arc(x, y, dot + (isHi ? 1.6 : 0.0), 0, Math.PI * 2);
+            ctx.beginPath();
+            ctx.arc(x, y, markerR + (isHi ? 0.6 : 0), 0, Math.PI * 2);
             ctx.fill();
 
             if (isHi) {
-                ctx.fillStyle = "rgba(255,255,255,0.85)";
-                ctx.fillText(name, x + 8, y);
+                ctx.strokeStyle = isMoon
+                    ? "rgba(204,244,255,0.92)"
+                    : "rgba(183,251,255,0.96)";
+                ctx.lineWidth = 1.2;
+                ctx.beginPath();
+                ctx.arc(x, y, markerR + 5.8, -0.48, Math.PI * 1.75);
+                ctx.stroke();
+                ctx.beginPath();
+                ctx.arc(x, y, markerR + 9.0, 0.22, 1.15);
+                ctx.stroke();
+                drawBodyLabel(name, x, y, true);
+            } else if (zoom >= 1.45 || (!isMoon && zoom >= 1.0)) {
+                drawBodyLabel(name, x, y, false);
             }
         }
+        ctx.restore();
 
-        // Player marker
+        // Player marker points along the camera's horizontal heading.
         if (pwp) {
             const px = originX + pwp.x * scale;
             const py = originY + pwp.z * scale;
-            ctx.fillStyle = "rgba(120,220,255,0.95)";
+            camera?.getWorldDirection?.(_mapDir);
+            const a = Math.atan2(_mapDir.z, _mapDir.x);
+            const tip = 8;
+            const back = 5;
+            const wing = 4;
+
+            ctx.save();
+            ctx.translate(px, py);
+            ctx.rotate(a);
+            ctx.fillStyle = "rgba(120,246,255,0.98)";
             ctx.beginPath();
-            ctx.arc(px, py, 3.0, 0, Math.PI * 2);
+            ctx.moveTo(tip, 0);
+            ctx.lineTo(-back, wing);
+            ctx.lineTo(-2, 0);
+            ctx.lineTo(-back, -wing);
+            ctx.closePath();
             ctx.fill();
-            ctx.strokeStyle = "rgba(120,220,255,0.25)";
+            ctx.restore();
+
+            ctx.strokeStyle = "rgba(120,246,255,0.34)";
+            ctx.lineWidth = 1;
             ctx.beginPath();
-            ctx.arc(px, py, 10.0, 0, Math.PI * 2);
+            ctx.arc(px, py, 11, 0, Math.PI * 2);
             ctx.stroke();
         }
 
         ctx.restore();
 
-        // Frame ring
+        // Bezel and bearing ticks.
         ctx.save();
-        ctx.strokeStyle = "rgba(255,255,255,0.14)";
-        ctx.lineWidth = 1.25;
-        ctx.beginPath();
-        ctx.arc(cx, cy, R, 0, Math.PI * 2);
-        ctx.stroke();
+        ctx.translate(cx, cy);
+        ctx.lineWidth = 1;
+        for (let i = 0; i < 4; i++) {
+            const start = i * Math.PI * 0.5 + 0.12;
+            ctx.strokeStyle = "rgba(120,246,255,0.42)";
+            ctx.beginPath();
+            ctx.arc(0, 0, R, start, start + Math.PI * 0.5 - 0.24);
+            ctx.stroke();
+        }
+        for (let i = 0; i < 24; i++) {
+            const a = (i / 24) * Math.PI * 2;
+            const major = i % 6 === 0;
+            const r0 = R - (major ? 8 : 4);
+            const r1 = R - 1;
+            ctx.strokeStyle = major
+                ? "rgba(183,251,255,0.56)"
+                : "rgba(120,246,255,0.20)";
+            ctx.beginPath();
+            ctx.moveTo(Math.cos(a) * r0, Math.sin(a) * r0);
+            ctx.lineTo(Math.cos(a) * r1, Math.sin(a) * r1);
+            ctx.stroke();
+        }
         ctx.restore();
+
+        ctx.fillStyle = "rgba(176,224,234,0.54)";
+        ctx.font = "8px ui-monospace, SFMono-Regular, Consolas, monospace";
+        ctx.textAlign = "center";
+        ctx.fillText(`RANGE ${(maxExtent / zoom / 1000).toFixed(1)}K`, cx, h - 8);
+        ctx.textAlign = "start";
     }
 
-    // Init
     resize();
     setOn(isOn);
 
