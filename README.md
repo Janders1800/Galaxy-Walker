@@ -17,9 +17,9 @@ https://janders1800.github.io/Galaxy-Walker/
 
 ## Controls
 - **Click**: pointer lock / mouse look   
-- **WASD** move • **Shift** boost • **Space** up/jump • **Ctrl** down   
-- **F** take off • **L** land nearest • **R** respawn   
-- **Q / E** roll (fly mode)   
+- **Walk: WASD** move • **Shift** move faster • **Space** jump/swim up • **Ctrl** swim down
+- **Vehicle: V** deploy/enter or exit the rover • **W/S** throttle • **A/D** steer • **Shift** boost • **Space** jump jets
+- **Fly: F** take off • **WASD** fly • **Shift** boost • **Space / Ctrl** up/down • **Q / E** roll • **L** land nearest
 - **M** toggle minimap • **+ / -** map zoom   
 - **G** fullscreen galaxy map • **Esc / G** close   
 - Fullscreen galaxy map: drag to pan • wheel to zoom • click to select • **double-click to warp** (fly mode only)   
